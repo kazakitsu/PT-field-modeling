@@ -1,13 +1,12 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="pt_field",
+    name="PT_field",
     version="0.1.0",
     description="Perturbative forward modeling at the field level",
     author="Kazuyuki Akitsu",
     url="https://github.com/kazakitsu/PT-field-modeling",
-    package_dir={"": "pt_field"},
-    packages=find_packages(where='pt_field'),
+    packages=find_packages(),
     install_requires=[
         "numpy>=1.20",
         "jax>=0.4.0",
