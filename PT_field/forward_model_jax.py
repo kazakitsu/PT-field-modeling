@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from jax import jit, lax, vmap
 from functools import partial
 
-import coord_jax as coord
+import PT_field.coord_jax as coord
 import lss_utils.assign_util_jax as assign_util
 import lss_utils.power_util_jax as power_util
 
@@ -235,7 +235,7 @@ class LPT_Forward(Base_Forward):
     # -------- shifted field generators --------------------------------
     def _stack_for_shift(self, scalars: Tuple[jnp.ndarray, ...]) -> jnp.ndarray:
         """Build stacked array depending on options."""
-        if self.lya:    # 1, d, d2, G2, G2_zz, deta, eta2, GG_zz
+        if self.lya:    # 1, d, d2, G2, G2_zz, deta, eta2, KK_zz
             ones = jnp.ones_like(scalars[0])
             return jnp.stack((ones,) + scalars, axis=0)
         if self.rsd:    # 1, d, d2, G2, G2_zz
@@ -255,20 +255,59 @@ class LPT_Forward(Base_Forward):
     @partial(jit, static_argnames=('self', 'mode'))
     def get_shifted_fields(
         self,
-        delta_k_E: jnp.ndarray,
+        delta_k: jnp.ndarray,
         *,
         growth_f: float = 0.0,
         mode: str = 'k_space',          # "k_space" or "r_space"
     ) -> jnp.ndarray:
         """Return shifted fields on Eulerian grid (k- or r-space)."""
-        delta_L = coord.func_extend(self.ng_L, delta_k_E)
-        pos_x   = self.lpt(delta_L, growth_f=growth_f)
-        scalars = self._scalar_fields_r(delta_L)
+        delta_k_L = coord.func_extend(self.ng_L, delta_k)
+        pos_x   = self.lpt(delta_k_L, growth_f=growth_f)
+        scalars = self._scalar_fields_r(delta_k_L)
         stacked = self._stack_for_shift(scalars)
 
         assign = (self.mesh.assign_fft if mode == 'k_space'
                   else self.mesh.assign_to_grid)
         return self._apply_mesh(pos_x, stacked, assign)
+
+
+    @partial(jit, static_argnames=('self', 'interp_mode'))
+    def get_final_field(
+        self,
+        fields_k: jnp.ndarray,            # shape (n_fields, ng, ng, ng//2+1)
+        beta_tab: jnp.ndarray,            # shape (n_fields, Nk, Nmu)
+        *,
+        k_edges: jnp.ndarray,             # (Nk+1,)
+        mu_edges: jnp.ndarray,            # (Nmu+1,)
+        interp_mode: str = "nearest",
+    ) -> jnp.ndarray:
+        """
+        Build delta_g(k) = sum_i beta_i(k,mu) O_i(k).
+
+        Notes
+        -----
+        * Each beta_i(k, mu) is supplied on the (Nk, Nmu) grid; it is first
+          interpolated to the Fourier grid via `Interpolator`.
+        * `fields_k` must share the same rfftn grid layout.
+        * Returns an rfftn-layout array with identical shape to every
+          `fields_k[i]`.
+        """
+        # Create (k, \mu) arrays on the Fourier grid -----------
+        ng_E = fields_k.shape[1]                      # grid size
+        if ng_E != self.ng_E:
+            raise ValueError(f"fields_k must have ng_E={self.ng_E}, got {ng_E}.")
+        kmag = jnp.sqrt((self.mesh.kvec**2).sum(axis=0))
+        mu   = jnp.abs(self.mesh.kvec[2]) / jnp.where(kmag > 0, kmag, 1.)
+
+        # Build interpolator and map over first axis ---------
+        interp = Interpolator(kmag, mu, k_edges, mu_edges,
+                              mode=interp_mode)
+        # beta_full has same shape as fields_k
+        beta_full = vmap(interp)(beta_tab)          # (n_fields, grid)
+
+        # Weighted sum over the field index -----------------
+        delta_g_k = jnp.sum(beta_full * fields_k, axis=0)  # grid
+        return delta_g_k
 
 
     
@@ -345,8 +384,8 @@ def orthogonalize(
             f       = f + Mgrid * fields[i]
         ortho[j] = f
 
-    return P_cross, Corr, Mcoef, ortho
-
+    #return P_cross, Corr, Mcoef, ortho
+    return jnp.array(ortho)
 
 
 class Interpolator:
@@ -374,15 +413,17 @@ class Interpolator:
     def __call__(self, table):
         Nk, Nmu = table.shape[:2]
         flat = table.reshape(Nk * Nmu, *table.shape[2:])
+
         if self.mode == 'nearest':
             return flat[self.idx]
+        
         M00 = flat[self.i00]; M10 = flat[self.i10]
         M01 = flat[self.i01]; M11 = flat[self.i11]
         tk, tm = self.tk, self.tm
-        return ((1-tk)*(1-tm))[...,None]*M00 \
-             + ((    tk)*(1-tm))[...,None]*M10 \
-             + ((1-tk)*(    tm))[...,None]*M01 \
-             + ((    tk)*(    tm))[...,None]*M11
+        return ((1-tk)*(1-tm))*M00 \
+             + ((    tk)*(1-tm))*M10 \
+             + ((1-tk)*(    tm))*M01 \
+             + ((    tk)*(    tm))*M11
 
 
 
