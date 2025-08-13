@@ -99,7 +99,7 @@ class LPT_Forward(Base_Forward):
         lpt_order: int = 1,
         bias_order: int = 2,
         dtype=jnp.float32,
-        max_scatter_indices: int = 800_000_000,
+        max_scatter_indices: int = 200_000_000,
         use_batched_fft: bool = True,
         # assignment switching knobs
         assign_mode: Literal["auto", "for", "vmap"] = "auto",
@@ -350,7 +350,7 @@ class LPT_Forward(Base_Forward):
         growth_f: float = 0.0,
         mode: str = 'k_space',
         neighbor_mode: str = 'auto',
-        fuse_updates_threshold: int=500_000_000,
+        fuse_updates_threshold: int=100_000_000,
     ) -> jnp.ndarray:
         """
         Build displacement (1LPT) and scalar real-space fields, assign them to Eulerian grid,
@@ -373,18 +373,24 @@ class LPT_Forward(Base_Forward):
         if mode == 'k_space':
             # Build non-interlaced and (optionally) interlaced stacks
             fields_E_r   = self._assign_fields_from_disp_to_grid(disp_r_L, fields_r_L,
-                                                               interlace=False, normalize_mean=True)
+                                                               interlace=False, normalize_mean=True,
+                                                               neighbor_mode=neighbor_mode,
+                                                               fuse_updates_threshold=fuse_updates_threshold)
             fields_E_ri  = None
             if self.mesh.interlace:
                 fields_E_ri = self._assign_fields_from_disp_to_grid(disp_r_L, fields_r_L,
-                                                                  interlace=True, normalize_mean=True)
+                                                                  interlace=True, normalize_mean=True,
+                                                                  neighbor_mode=neighbor_mode,
+                                                                  fuse_updates_threshold=fuse_updates_threshold)
             # Single batched FFT + deconvolution (provided by Mesh_Assignment)
             fields_k = self.mesh.fft_deconvolve_batched(fields_E_r, fields_E_ri)
             return fields_k.astype(self.complex_dtype)
         else:
             # Real-space: return non-interlaced assigned grids
             fields_E_r = self._assign_fields_from_disp_to_grid(disp_r_L, fields_r_L,
-                                                             interlace=False, normalize_mean=True)
+                                                             interlace=False, normalize_mean=True,
+                                                             neighbor_mode=neighbor_mode,
+                                                             fuse_updates_threshold=fuse_updates_threshold)
             return fields_E_r.astype(self.real_dtype)
         
     @partial(jit, static_argnames=('self', 'measure_pk'))
