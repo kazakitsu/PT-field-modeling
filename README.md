@@ -24,10 +24,9 @@ Core ideas:
 
 - **LPT-based forward model (`LPT_Forward`)**
   - LPT displacement in real space, with optional **RSD**: $\psi_z \rightarrow \psi_z (1 + f)$.
-  - Scalar field builders up to **quadratic** order:  
-    $1, \delta, \delta^2, {\mathcal{G}_2}$.
-    If `rsd` is enabled, ${\mathcal{G}^{\parallel}_{2}}$.  
-    With `lya=True`, also builds $\eta$-related helpers: $\eta^2$, $\delta\,\eta$, $KK^{\parallel}$.
+  - Scalar field builders up to **quadratic** order: $1, \delta, \delta^2, {\mathcal{G}_2}$
+    - With `rsd=True`, also builds ${\mathcal{G}^{\parallel}_{2}}$.  
+    - With `lya=True`, also builds $\eta$-related helpers: $\eta^2$, $\delta\,\eta$, $KK^{\parallel}$.
 
 - **Orthogonalization and diagnostics**
   - `orthogonalize(...)`: per $(k,\mu)$ bin Cholesky-based orthonormalization of fields.
