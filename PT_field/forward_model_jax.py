@@ -306,10 +306,7 @@ class LPT_Forward(Base_Forward):
         if (self.ng_E <= self.vmap_ng_threshold) and (n_fields <= self.vmap_fields_threshold):
             return "vmap"
         return "for"
-    
-    def _apply_mesh_from_disp(self, disp_r, fields_r, fn_from_disp):
-        return jnp.array(vmap(fn_from_disp, in_axes=(None, 0))(disp_r, fields_r))
-    
+        
     def _assign_fields_from_disp_to_grid(
         self,
         disp_r: jnp.ndarray,      # (3, ng_L, ng_L, ng_L)
@@ -317,6 +314,8 @@ class LPT_Forward(Base_Forward):
         *,
         interlace: bool = False,
         normalize_mean: bool = True,
+        neighbor_mode: str = 'auto',
+        fuse_updates_threshold: int = 100_000_000,
     ) -> jnp.ndarray:
         """
         Assign many real-space fields to Eulerian grid using either `for` or `vmap`.
@@ -327,7 +326,8 @@ class LPT_Forward(Base_Forward):
 
         if mode == "vmap":
             fn = lambda w: self.mesh.assign_from_disp_to_grid(
-                disp_r, w, interlace=interlace, normalize_mean=normalize_mean
+                disp_r, w, interlace=interlace, normalize_mean=normalize_mean, 
+                neighbor_mode=neighbor_mode, fuse_updates_threshold=fuse_updates_threshold,
             )
             # vmap over field axis
             fields = vmap(fn, in_axes=0, out_axes=0)(fields_r)
@@ -336,7 +336,8 @@ class LPT_Forward(Base_Forward):
             for i in range(m):
                 w = fields_r[i]
                 gi = self.mesh.assign_from_disp_to_grid(
-                    disp_r, w, interlace=interlace, normalize_mean=normalize_mean
+                    disp_r, w, interlace=interlace, normalize_mean=normalize_mean, 
+                    neighbor_mode=neighbor_mode, fuse_updates_threshold=fuse_updates_threshold,
                 )
                 fields.append(gi)
             fields = jnp.stack(fields, axis=0)
