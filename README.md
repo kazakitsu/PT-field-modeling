@@ -11,7 +11,7 @@ It integrates with [`lss_utils`](https://github.com/kazakitsu/lss_utils) for mes
 Core ideas:
 
 - Build the LPT displacement from an input linear density field $\delta_L(\mathbf{k})$.
-- Construct scalar fields in real space $[1, \delta, \delta^2, {\cal G}_2, \cdots]$.
+- Construct scalar fields in real space $[1, \delta, \delta^2, \mathcal{G}_2, \cdots]$.
 - Assign these fields to an Eulerian grid using particle–mesh style advection from the Lagrangian grid.
 - Optionally transform to Fourier space and deconvolve the assignment window in one batched call.
 - Work per $(k,\mu)$ bin to orthogonalize fields or to combine them into a final modeled field.
