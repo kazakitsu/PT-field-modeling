@@ -25,7 +25,7 @@ if use_jax:
         high_pass_filter_fourier,
     )
     from .forward_model_jax import Base_Forward, LPT_Forward
-    from .utils_jax import growth_D_f, orthogonalize, fit_beta_poly_from_table, compute_corr_2d, check_max_rij, compute_pks_2d
+    from .utils_jax import growth_D_f, orthogonalize, beta_polyfit, compute_corr_2d, check_max_rij, compute_pks_2d
 else:
     from .coord import (
         rfftn_kvec,
@@ -62,7 +62,7 @@ __all__ = [
     "Base_Forward",
     "LPT_Forward",
     "orthogonalize",
-    "fit_beta_poly_from_table",
+    "beta_polyfit",
     "corr_by_mu",
     "check_max_rij",
     "compute_corr_2d",
