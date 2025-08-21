@@ -446,7 +446,6 @@ class LPT_Forward(Base_Forward):
         beta0 = jnp.zeros((n_fields, Nk, Nmu), dtype=dtype)
         beta  = lax.fori_loop(0, Nmu, mu_body, beta0)
         return beta
-
         
     def _ensure_nearest_cache(self, k_edges: jnp.ndarray, mu_edges: jnp.ndarray):
         """
@@ -483,14 +482,14 @@ class LPT_Forward(Base_Forward):
         self._mu_edges_cache = jnp.asarray(mu_edges, dtype=self.real_dtype)
 
     @partial(jit, static_argnames=('self',))
-    def _get_final_field(
+    def _get_final_field_table(
         self,
         fields_k: jnp.ndarray,            # (n_fields, ng_E, ng_E, ng_E//2+1)
         beta_tab: jnp.ndarray,            # (n_fields, Nk, Nmu)
     ) -> jnp.ndarray:
         """
-        Build delta_g(k) = sum_i beta_i[bin(k,mu)] * O_i(k) using a precomputed nearest map.
-        The accumulation streams across the field-axis to keep peak memory low.
+        Build delta_g(k) = sum_i beta_i[bin(k,mu)] * O_i(k,mu).
+        Nearest-bin lookup version for beta given on (k,mu) table.
         """
         num_fields = fields_k.shape[0]
         NkNmu = beta_tab.shape[1] * beta_tab.shape[2]
@@ -506,354 +505,131 @@ class LPT_Forward(Base_Forward):
 
         acc = lax.fori_loop(0, num_fields, loop, acc0)
         return acc
+    
+    @partial(jit, static_argnames=('self',))
+    def _get_final_field_const(
+        self,
+        fields_k: jnp.ndarray,        # (n_fields, ng, ng, ng//2+1), complex
+        beta_const: jnp.ndarray,      # (n_fields,), real
+    ) -> jnp.ndarray:
+        """
+        Constant coefficients: delta_g = sum_i beta[i] * O_i(k, mu).
+        """
+        n = fields_k.shape[0]
+        beta_const = jnp.asarray(beta_const, dtype=self.real_dtype)
+
+        acc0 = jnp.zeros_like(fields_k[0])
+
+        def loop(i, acc):
+            return acc + beta_const[i] * fields_k[i]
+        return lax.fori_loop(0, n, loop, acc0)
+    
+    @partial(jit, static_argnames=('self',))
+    def _get_final_field_poly(
+        self,
+        fields_k: jnp.ndarray,           # (n_fields, ng, ng, ng//2+1), complex
+        coeffs: jnp.ndarray,             # (n_fields, Lk, Lmu), real
+        k_pows: jnp.ndarray,             # (Lk,), int (exponents for k)
+        mu2_pows: jnp.ndarray,            # (Lmu,), int
+    ) -> jnp.ndarray:
+        """
+        Polynomial coefficients on (k,mu):
+            beta_i(k,mu) = sum_{a,b} coeffs[i,a,b] * (k**k_pows[a]) * (mu2**mu2_pows[b]),
+        """
+        # Build k^2 and mu on the Eulerian rfft grid
+        k2  = (self.kx2E[:, None, None] + self.ky2E[None, :, None] + self.kz2E[None, None, :]).astype(self.real_dtype)
+        mu2  = jnp.where(k2 > 0, self.kz2E[None, None, :] / k2, 0.0).astype(self.real_dtype)
+        base_k = jnp.sqrt(jnp.maximum(k2, 0.0)).astype(self.real_dtype)
+
+        # Precompute required powers for base_k and mu2:
+        # stacks: Kpow[a] = base_k ** k_pows[a],  Mpow[b] = mu2 ** mu2_pows[b]
+        Lk = k_pows.shape[0]
+        Lm = mu2_pows.shape[0]
+
+        def build_pows(base, exps):
+            # Allocate (L, grid) and fill with base**exps[i]
+            out0 = jnp.zeros((exps.shape[0],) + base.shape, dtype=self.real_dtype)
+            def body(i, acc):
+                e = exps[i]
+                val = jnp.where(e == 0, jnp.ones_like(base), base ** e)
+                return acc.at[i].set(val)
+            return lax.fori_loop(0, exps.shape[0], body, out0)
+
+        Kpow = build_pows(base_k, k_pows.astype(jnp.int32))   # (Lk, grid)
+        Mpow = build_pows(mu2,    mu2_pows.astype(jnp.int32))  # (Lmu, grid)
+
+        n_fields = fields_k.shape[0]
+        coeffs = coeffs.astype(self.real_dtype)
+
+        acc0 = jnp.zeros_like(fields_k[0])  # complex
+
+        def loop_field(i, acc):
+            # Build beta_i(k,mu) on the fly to avoid storing a full (grid) per field.
+            # beta_i = sum_{a,b} coeffs[i,a,b] * Kpow[a] * Mpow[b]
+            coef_i = coeffs[i]  # (Lk, Lmu)
+
+            # Accumulate over a, b with two nested loops.
+            beta_grid0 = jnp.zeros_like(base_k)  # real
+            def loop_a(a, beta_acc):
+                Ka = Kpow[a]  # grid
+                def loop_b(b, beta_acc2):
+                    Mb = Mpow[b]
+                    return beta_acc2 + coef_i[a, b] * Ka * Mb
+                beta_acc = lax.fori_loop(0, Lm, loop_b, beta_acc)
+                return beta_acc
+            beta_i_grid = lax.fori_loop(0, Lk, loop_a, beta_grid0)  # real, shape=grid
+
+            return acc + beta_i_grid * fields_k[i]  # complex
+
+        return lax.fori_loop(0, n_fields, loop_field, acc0)
 
     def get_final_field(
         self,
-        fields_k: jnp.ndarray,            # (n_fields, ng, ng, ng//2+1)
-        beta_tab: jnp.ndarray,            # (n_fields, Nk, Nmu)
+        fields_k: jnp.ndarray,        # (n_fields, ng, ng, ng//2+1)
+        beta: jnp.ndarray,            # see beta_kind below
         *,
-        k_edges: jnp.ndarray,             # (Nk+1,)
-        mu_edges: jnp.ndarray,            # (Nmu+1,)
+        beta_kind: Literal['table','const','poly'] = 'table',
+        k_edges: jnp.ndarray | None = None,   # required for beta_kind='table'
+        mu_edges: jnp.ndarray | None = None,  # required for beta_kind='table'
+        poly_k_pows: jnp.ndarray | None = None,   # (Lk,), for beta_kind='poly'
+        poly_mu2_pows: jnp.ndarray | None = None,  # (Lmu,), for beta_kind='poly'
     ) -> jnp.ndarray:
-        """Build delta_g(k) = sum_i beta_i(k,mu) O_i(k) with on-the-fly (k,mu)."""
-        ng_E = fields_k.shape[1]
-        if ng_E != self.ng_E:
-            raise ValueError(f"fields_k must have ng_E={self.ng_E}, got {ng_E}.")
+        """
+        Build delta_g(k, mu) = sum_i beta_i(k,mu) * O_i(k,mu) with three beta modes:
 
-        # Build/reuse the grid -> (k,mu) bin mapping (host-side; no JIT cost).
-        self._ensure_nearest_cache(k_edges, mu_edges)
-        # Run the jitted accumulation kernel.
-        return self._get_final_field(fields_k, beta_tab)
+        beta_kind='table':
+            beta: (n_fields, Nk, Nmu), nearest-bin lookup using (k_edges, mu_edges).
 
-# -------------------- Orthogonalize & interpolation utilities --------------------
+        beta_kind='const':
+            beta: (n_fields,), constant per-field weights.
 
-from jax import jit, vmap, lax
-import jax.numpy as jnp
+        beta_kind='poly':
+            beta: (n_fields, Lk, Lmu) coefficients for a polynomial in k and mu.
+                  Provide poly_k_pows=(Lk,), poly_mu2_pows=(Lmu,).
+                  If use_k2=True, k-term uses (k^2)^p instead of k^p.
+        """
+        # Sanity checks
+        if beta_kind == 'table':
+            if k_edges is None or mu_edges is None:
+                raise ValueError("beta_kind='table' requires k_edges and mu_edges.")
+            if beta.ndim != 3:
+                raise ValueError("For beta_kind='table', beta must have shape (n_fields, Nk, Nmu).")
 
-@partial(jit, static_argnames=('measure_pk','interp_mode','Nmin','jitter','dtype'))
-def orthogonalize(
-    fields: jnp.ndarray,            # (n, ng, ng, ng//2+1)
-    measure_pk,                     # Measure_Pk instance (self is static)
-    boxsize: float,
-    k_edges: jnp.ndarray,           # (Nk+1,)
-    mu_edges: jnp.ndarray,          # (Nmu+1,)
-    interp_mode: str = 'nearest',
-    Nmin: int = 5,
-    jitter: float = 1e-14,
-    dtype=jnp.float32,
-):
-    """
-    Orthonormalize Fourier-space fields per (k,mu) bin using Cholesky on the correlation matrix.
+            # Build/reuse the grid -> (k,mu) bin mapping and run the table kernel.
+            self._ensure_nearest_cache(k_edges, mu_edges)
+            return self._get_final_field_table(fields_k, beta)
 
-    Speed & memory optimizations:
-      * Vectorize power-spectrum evaluation across mu-bins with `vmap` to reduce Python overhead.
-      * Compute L^{-1} via a triangular solve (no dense matrix inverse).
-      * Batch updates when writing the cross-power upper triangle.
-    """
-    n   = fields.shape[0]
-    Nk  = k_edges.size - 1
-    Nmu = mu_edges.size - 1
-    ctype = jnp.complex128 if dtype == jnp.float64 else jnp.complex64
+        elif beta_kind == 'const':
+            if beta.ndim != 1:
+                raise ValueError("For beta_kind='const', beta must have shape (n_fields,).")
+            return self._get_final_field_const(fields_k, beta)
 
-    if dtype != measure_pk.dtype:
-        raise ValueError(f"measure_pk.dtype must match dtype={dtype}, got {measure_pk.dtype}.")
+        elif beta_kind == 'poly':
+            if beta.ndim != 3:
+                raise ValueError("For beta_kind='poly', beta must have shape (n_fields, Lk, Lmu).")
+            if poly_k_pows is None or poly_mu2_pows is None:
+                raise ValueError("For beta_kind='poly', provide poly_k_pows and poly_mu_pows.")
+            return self._get_final_field_poly(fields_k, beta, poly_k_pows, poly_mu2_pows)
 
-    # Cast once to the complex working dtype.
-    fields = jnp.asarray(fields, dtype=ctype)
-
-    # ---- 1) Vectorized P(k,mu): auto & cross --------------------------------
-    # Prepare mu-bin edges for vectorized calls: (Nmu,)
-    mu0 = mu_edges[:-1]
-    mu1 = mu_edges[1:]
-
-    # Helper: evaluate Measure_Pk over all mu-bins for a given (f1, f2)
-    # Returns arrays shaped (Nk, Nmu) for [Pk*V, N_modes].
-    def _pk_mu_all(f1, f2):
-        # map over mu-bins -> (Nmu, Nk, 3)
-        res = vmap(lambda a, b: measure_pk(f1, f2, ell=0, mu_min=a, mu_max=b))(mu0, mu1)
-        # transpose to (Nk, Nmu) and extract columns
-        PkV = jnp.swapaxes(res[..., 1], 0, 1)  # (Nk, Nmu)
-        Nm  = jnp.swapaxes(res[..., 2], 0, 1)  # (Nk, Nmu)
-        return PkV.astype(dtype), Nm.astype(dtype)
-
-    # Allocate outputs
-    P_auto  = jnp.zeros((Nk, Nmu, n),     dtype=dtype)
-    P_cross = jnp.zeros((Nk, Nmu, n, n),  dtype=dtype)
-
-    # Autos: evaluate for each field; grab N_modes from the first field (identical for all)
-    P0, N_modes = _pk_mu_all(fields[0], None)
-    P_auto = P_auto.at[:, :, 0].set(P0)
-    # Loop remaining autos; Python loop is cheap (vmap inside handles the heavy lifting)
-    for i in range(1, n):
-        Pi, _ = _pk_mu_all(fields[i], None)
-        P_auto = P_auto.at[:, :, i].set(Pi)
-
-    # Cross (upper triangle): for each fixed j, vectorize over i<j
-    for j in range(n):
-        if j == 0:
-            continue
-        # Stack P(i,j) for all i<j via vmap to reduce call overhead
-        def _cross_with_j(fi):
-            Pij, _ = _pk_mu_all(fi, fields[j])
-            return Pij  # (Nk, Nmu)
-        P_ij_stack = vmap(_cross_with_j)(fields[:j])                 # (j, Nk, Nmu)
-        P_ij_stack = jnp.swapaxes(P_ij_stack, 0, 1)                  # (Nk, j, Nmu)
-        P_ij_stack = jnp.swapaxes(P_ij_stack, 1, 2)                  # (Nk, Nmu, j)
-
-        # Fill upper triangle (i<j, j)
-        P_cross = P_cross.at[:, :, :j, j].set(P_ij_stack)          # (Nk, Nmu, j)
-        # Mirror to (j, i<j). No transpose is needed: shape matches  (Nk, Nmu, j).
-        P_cross = P_cross.at[:, :, j, :j].set(P_ij_stack)          # (Nk, Nmu, j)
-
-    # Put autos on the diagonal
-    diag = jnp.arange(n)
-    P_cross = P_cross.at[..., diag, diag].set(P_auto)
-
-    # ---- 2) Correlation matrix per (k,mu) & Cholesky -------------------------
-    low_stat = N_modes <= Nmin
-
-    # Corr = P_cross / sqrt(P_auto_i * P_auto_j)
-    denom = jnp.sqrt(jnp.clip(P_auto[..., None] * P_auto[..., None, :], a_min=0.0))
-    Corr  = jnp.where(denom > 0, P_cross / denom, 0.0)
-    Corr  = Corr.at[..., diag, diag].set(1.0)
-    Corr  = _nearest_fill_generic(Corr, low_stat, Nk, Nmu)  # fill low-stat bins
-
-    # Cholesky per (Nk,Nmu) with a small jitter on the diagonal for stability
-    eye = jnp.eye(n, dtype=dtype)
-
-    # vmap over flattened (Nk*Nmu) bins to keep compile size reasonable
-    Corr_flat = Corr.reshape(Nk * Nmu, n, n)
-    def _chol_inv_lower(A):
-        # Compute L = chol(A + jitter*I) and solve L * X = I to get L^{-1}
-        L = jnp.linalg.cholesky(A + jitter * eye)
-        Linv = lax.linalg.triangular_solve(L, eye, left_side=True, lower=True)
-        return Linv
-    Linv = vmap(_chol_inv_lower)(Corr_flat).reshape(Nk, Nmu, n, n)  # (Nk,Nmu,n,n)
-
-    # Build Mcoef = (Linv / diag(Linv)) * sqrt(P_auto_i / P_auto_j)
-    diagL = jnp.diagonal(Linv, axis1=2, axis2=3)                            # (Nk,Nmu,n)
-    ratio = jnp.sqrt(jnp.where(P_auto[..., None, :] > 0,
-                               P_auto[..., None] / jnp.maximum(P_auto[..., None, :], 1e-30),
-                               0.0))                                         # (Nk,Nmu,n,n)
-    Mcoef = (Linv / diagL[..., :, None]) * ratio                             # (Nk,Nmu,n,n)
-    Mcoef = _nearest_fill_generic(Mcoef, low_stat, Nk, Nmu)                  # fill low-stat bins
-
-    # ---- 3) Expand Mcoef(k,mu) to grid and perform sequential orthogonalization ----
-    ng = fields.shape[1]
-    # Build (k,mu) once for the target grid of size (ng,ng,ng//2+1)
-    kx, ky, kz = coord.kaxes_1d(ng, boxsize, dtype=dtype)
-    kx2, ky2, kz2 = kx * kx, ky * ky, kz * kz
-    k2   = kx2[:, None, None] + ky2[None, :, None] + kz2[None, None, :]
-    kmag = jnp.sqrt(jnp.maximum(k2, 0.0))
-    mu   = jnp.where(k2 > 0, jnp.sqrt(kz2[None, None, :] / k2), 0.0)
-
-    # Construct the interpolator once per call; reused for all (j,i)
-    interp = Interpolator(kmag, mu, k_edges, mu_edges, mode=interp_mode)
-
-    # Sequential Gram-Schmidt-like update using (k,mu)-dependent mixing
-    ortho = list(fields)
-    for j in range(1, n):
-        f = ortho[j]
-        for i in range(j):
-            coef_ji = Mcoef[:, :, j, i]     # (Nk, Nmu)
-            Mgrid   = interp(coef_ji)       # (...grid...)
-            f       = f + Mgrid * fields[i]
-        ortho[j] = f
-
-    return jnp.array(ortho)
-
-class Interpolator:
-    def __init__(self, kmag, mu, k_edges, mu_edges, mode: str = 'nearest'):
-        self.mode = mode
-        Nk, Nmu = k_edges.size - 1, mu_edges.size - 1
-        kbin  = jnp.clip(jnp.searchsorted(k_edges,  kmag, side="right") - 1, 0, Nk-1)
-        mubin = jnp.clip(jnp.searchsorted(mu_edges, mu,   side="right") - 1, 0, Nmu-1)
-        if mode == 'nearest':
-            self.idx = kbin * Nmu + mubin
         else:
-            kbin1  = jnp.clip(kbin + 1, 0, Nk-1)
-            mubin1 = jnp.clip(mubin + 1, 0, Nmu-1)
-            k0, k1 = k_edges[kbin],  k_edges[kbin1]
-            m0, m1 = mu_edges[mubin], mu_edges[mubin1]
-            self.tk = jnp.where(k1 > k0, (kmag - k0) / (k1 - k0), 0.0)
-            self.tm = jnp.where(m1 > m0, (mu   - m0) / (m1 - m0), 0.0)
-            flat_idx = lambda kb, mb: kb * Nmu + mb
-            self.i00 = flat_idx(kbin,  mubin)
-            self.i10 = flat_idx(kbin1, mubin)
-            self.i01 = flat_idx(kbin,  mubin1)
-            self.i11 = flat_idx(kbin1, mubin1)
-
-    def __call__(self, table):
-        Nk, Nmu = table.shape[:2]
-        flat = table.reshape(Nk * Nmu, *table.shape[2:])
-        if self.mode == 'nearest':
-            return flat[self.idx]
-        M00 = flat[self.i00]; M10 = flat[self.i10]
-        M01 = flat[self.i01]; M11 = flat[self.i11]
-        tk, tm = self.tk, self.tm
-        return ((1 - tk) * (1 - tm)) * M00 \
-             + ((    tk) * (1 - tm)) * M10 \
-             + ((1 - tk) * (    tm)) * M01 \
-             + ((    tk) * (    tm)) * M11
-
-def _nearest_fill_generic(data2d, mask, Nk, Nmu):
-    flat  = data2d.reshape((Nk * Nmu,) + data2d.shape[2:])
-    mflat = mask.ravel()
-    good = jnp.nonzero(~mflat, size=Nk * Nmu, fill_value=-1)[0]
-    bad  = jnp.nonzero( mflat, size=Nk * Nmu, fill_value=-1)[0]
-    gk, gm = good // Nmu, good % Nmu
-    def choose(b):
-        kb, mb = b // Nmu, b % Nmu
-        d2 = (gk - kb)**2 + (gm - mb)**2
-        d2 = jnp.where(good >= 0, d2, 1e12)
-        return good[jnp.argmin(d2)]
-    from jax import vmap
-    repl = vmap(choose)(bad)
-    repl = jnp.where(bad >= 0, repl, bad)
-    flat_out = flat.at[bad].set(flat[repl])
-    return flat_out.reshape(data2d.shape)
-
-
-@partial(jit, static_argnames=('measure_pk',))
-def compute_corr_2d(
-    fields_k: jnp.ndarray,   # (n_fields, ng, ng, ng//2+1), complex
-    mu_edges: jnp.ndarray,   # (Nmu+1,)
-    *,
-    measure_pk               # Measure_Pk instance (static to JIT)
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Compute r_ij(k) within each mu-bin, evaluating only i<=j and mirroring.
-
-    Returns
-    -------
-    k_arr : (Nk,)               # bin-averaged k (mu-independent)
-    R_all : (Nmu, n, n, Nk)     # r_ij(k) for each mu-bin
-    Notes
-    -----
-    - We evaluate only the upper triangle (i<=j) and symmetrize.
-    - Diagonal r_ii(k) is set to exactly 1.
-    - Uses lax.fori_loop over mu-bins to keep compile size modest.
-    """
-    n_fields = fields_k.shape[0]
-    dtype = measure_pk.dtype
-
-    # k-bin centers from the estimator (independent of mu)
-    k_arr = jnp.asarray(measure_pk.k_mean, dtype=dtype)
-    Nk = int(k_arr.shape[0])
-
-    # Upper-triangular index set WITHOUT diagonal for off-diagonals (i<j)
-    # (we'll set the diagonal to 1 explicitly below)
-    ii, jj = jnp.triu_indices(n_fields, k=1)
-    npairs = int(ii.shape[0])
-
-    Nmu = int(mu_edges.shape[0] - 1)
-
-    def pk_matrix_for_mu(mu_min, mu_max):
-        """Build R(k) for a single mu-bin via upper-tri evaluation + symmetrization."""
-        eps = jnp.asarray(1e-37, dtype=dtype)
-
-        # 1) Autos P_ii(k) for i=0..n-1  (vectorized via lax.map over i)
-        def auto_body(i):
-            # measure_pk(a, None, ...) returns (Nk,3); take the P column
-            out = measure_pk(fields_k[i], None, ell=0, mu_min=mu_min, mu_max=mu_max)
-            return out[:, 1].astype(dtype)                      # (Nk,)
-        Auto = lax.map(lambda i: auto_body(i), jnp.arange(n_fields, dtype=jnp.int32))  # (n, Nk)
-
-        # 2) Off-diagonal P_ij(k) for i<j only (loop over 'pairs')
-        def pair_body(pidx):
-            i = ii[pidx]
-            j = jj[pidx]
-            out = measure_pk(fields_k[i], fields_k[j], ell=0, mu_min=mu_min, mu_max=mu_max)
-            Pij = out[:, 1].astype(dtype)                       # (Nk,)
-            denom = jnp.sqrt(Auto[i] * Auto[j]) + eps           # (Nk,)
-            return Pij / denom                                  # (Nk,)
-        # Stack r_ij(k) for i<j: shape (npairs, Nk)
-        rij_pairs = lax.map(pair_body, jnp.arange(npairs, dtype=jnp.int32))
-
-        # 3) Assemble full R(n,n,Nk): diag=1, off-diagonals filled & mirrored
-        rij = jnp.zeros((n_fields, n_fields, Nk), dtype=dtype)
-        # diag -> exactly 1 across all k (broadcast on last axis)
-        eye = jnp.eye(n_fields, dtype=dtype)[..., None]                # (n, n, 1)
-        rij = rij + eye
-        # fill upper triangle (i<j)
-        rij = rij.at[ii, jj, :].set(rij_pairs)                      # (npairs, Nk)
-        # mirror to lower triangle
-        rij = rij.at[jj, ii, :].set(rij_pairs)
-
-        return rij                                                # (n, n, Nk)
-
-    # 4) Loop over mu-bins with fori_loop
-    def mu_body(m, acc):
-        mu_min = mu_edges[m]
-        mu_max = mu_edges[m + 1]
-        rij_m = pk_matrix_for_mu(mu_min, mu_max)                   # (n, n, Nk)
-        return acc.at[m].set(rij_m)
-
-    rij0 = jnp.zeros((Nmu, n_fields, n_fields, Nk), dtype=dtype)
-    rij_all = lax.fori_loop(0, Nmu, mu_body, rij0)                  # (Nmu, n, n, Nk)
-
-    return k_arr, rij_all
-
-
-def check_max_rij(rij: jnp.ndarray) -> None:
-    """
-    Pretty-print max_k |r_ij| for each mu-bin using the output of corr_by_mu(...).
-    """
-    Nmu, n, _, Nk = rij.shape
-    for m in range(Nmu):
-        print(m)
-        Rm = rij[m]  # (n, n, Nk)
-        for i in range(n):
-            for j in range(i + 1, n):
-                val = float(jnp.max(jnp.abs(Rm[i, j])))
-                print(f"{i}{j}  max|r_ij| = {val:.3e}")
-
-
-@partial(jit, static_argnames=('measure_pk',))
-def compute_pks_2d(
-    fields_k: jnp.ndarray,   # (n_fields, ng, ng, ng//2+1), complex
-    mu_edges: jnp.ndarray,   # (Nmu+1,)
-    *,
-    measure_pk               # Measure_Pk instance (static)
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """
-    Measure auto P(k) for many fields across all mu-bins in one pass.
-
-    Returns
-    -------
-    k_arr   : (Nk,)                 # bin-averaged k
-    P_many  : (n, Nk, Nmu)          # auto power for each field and mu-bin
-    N_modes : (Nk, Nmu)             # counts per (k,mu) (field-independent)
-    Notes
-    -----
-    - Loops over mu-bins with fori_loop.
-    - Inside each mu-bin, uses lax.map over field index.
-    """
-    n_fields = fields_k.shape[0]
-    dtype = measure_pk.dtype
-    k_arr = jnp.asarray(measure_pk.k_mean, dtype=dtype)
-    Nk = int(k_arr.shape[0])
-    Nmu = int(mu_edges.shape[0] - 1)
-
-    def mu_body(m, carry):
-        P_acc, N_acc = carry
-        mu_min = mu_edges[m]
-        mu_max = mu_edges[m + 1]
-
-        # We also grab N_modes from the first field; it's field-independent.
-        out0 = measure_pk(fields_k[0], None, ell=0, mu_min=mu_min, mu_max=mu_max)
-        N_m  = out0[:, 2].astype(dtype)                         # (Nk,)
-
-        def one_field(i):
-            out = measure_pk(fields_k[i], None, ell=0, mu_min=mu_min, mu_max=mu_max)
-            return out[:, 1].astype(dtype)                      # (Nk,)
-
-        P_m = lax.map(one_field, jnp.arange(n_fields, dtype=jnp.int32))  # (n, Nk)
-        P_acc = P_acc.at[:, :, m].set(P_m)
-        N_acc = N_acc.at[:, m].set(N_m)
-        return (P_acc, N_acc)
-
-    P0 = jnp.zeros((n_fields, Nk, Nmu), dtype=dtype)
-    N0 = jnp.zeros((Nk, Nmu), dtype=dtype)
-    P_many, N_modes = lax.fori_loop(0, Nmu, mu_body, (P0, N0))
-    return k_arr, P_many, N_modes
+            raise ValueError(f"Unknown beta_kind='{beta_kind}'")
