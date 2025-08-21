@@ -63,7 +63,6 @@ __all__ = [
     "LPT_Forward",
     "orthogonalize",
     "beta_polyfit",
-    "corr_by_mu",
     "check_max_rij",
     "compute_corr_2d",
     "compute_pks_2d",
