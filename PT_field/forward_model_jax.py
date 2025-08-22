@@ -152,11 +152,11 @@ class LPT_Forward(Base_Forward):
             disp1_r = disp1_r.at[2].add(disp1_r[2] * gf)
         return disp1_r  # (3, ng, ng, ng)
 
-    # -------- scalar fields in real space -------
+    # -------- scalar fields in position space -------
     @partial(jit, static_argnames=('self',))
     def _scalar_fields_r(self, delta_k: jnp.ndarray) -> jnp.ndarray:
         """
-        Build scalar fields in real space: [1, delta, d^2, G2, (G2_zz), (LyA extras...)]
+        Build scalar fields in position space: [1, delta, d^2, G2, (G2_zz), (LyA extras...)]
         Returns stacked array with leading field axis.
         """
         delta_k = delta_k.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
@@ -198,6 +198,70 @@ class LPT_Forward(Base_Forward):
                 KK_zz_r = GG_zz_r - (2.0/3.0) * deta_r + (1.0/9.0) * d2_r
                 KK_zz_r = KK_zz_r - jnp.mean(KK_zz_r)
                 fields.extend([eta2_r, deta_r, KK_zz_r])
+
+        return jnp.array(fields)
+    
+    # -------- tensor fields in position space -------
+    @partial(jit, static_argnames=('self',))
+    def _tensor_fields_r(self, delta_k: jnp.ndarray) -> jnp.ndarray:
+        """
+        Build tensor fields in position space: [K_ij, dK_ij, G_ij, T_ij, ...]
+        Returns
+        -------
+        (n_fields, 6, ng, ng, ng) with order (xx,xy,xz,yy,yz,zz) in the 6-axis.
+        """
+        delta_k = delta_k.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
+        
+        K_ij_k = coord.apply_Gij_k(delta_k, self.kx, self.ky, self.kz)  # (6, ng_L, ng_L, ng_L//2+1)
+        K_ij_k = coord.apply_traceless(K_ij_k)
+
+        fields = []
+
+        if self.bias_order >= 1:
+            K_ij_r = self._irfftn_vec(K_ij_k)  # (6, ng_L, ng_L, ng_L)
+            fields.append(K_ij_r)
+
+        if self.bias_order >= 2:
+            delta_r = self.irfftn(delta_k)
+
+            dK_ij_r = K_ij_r * delta_r[None, :, :, :]  # (6, ng_L, ng_L, ng_L)
+            dK_ij_r = dK_ij_r - jnp.mean(dK_ij_r, axis=(1, 2, 3), keepdims=True)
+
+            #G_ij_r = self._irfftn_vec(G_ij_k)  # (6, ng_L, ng_L, ng_L)
+
+            #KK_xx_r = G_ij_r[0]*G_ij_r[0] + G_ij_r[1]*G_ij_r[1] + G_ij_r[2]*G_ij_r[2]
+            #KK_xy_r = G_ij_r[0]*G_ij_r[1] + G_ij_r[1]*G_ij_r[3] + G_ij_r[2]*G_ij_r[4]
+            #KK_xz_r = G_ij_r[0]*G_ij_r[2] + G_ij_r[1]*G_ij_r[4] + G_ij_r[2]*G_ij_r[5]
+            #KK_yy_r = G_ij_r[3]*G_ij_r[3] + G_ij_r[1]*G_ij_r[1] + G_ij_r[4]*G_ij_r[4]
+            #KK_yz_r = G_ij_r[3]*G_ij_r[4] + G_ij_r[1]*G_ij_r[2] + G_ij_r[4]*G_ij_r[5]
+            #KK_zz_r = G_ij_r[5]*G_ij_r[5] + G_ij_r[2]*G_ij_r[2] + G_ij_r[4]*G_ij_r[4]
+
+            KK_xx_r = K_ij_r[0]*K_ij_r[0] + K_ij_r[1]*K_ij_r[1] + K_ij_r[2]*K_ij_r[2]
+            KK_xy_r = K_ij_r[0]*K_ij_r[1] + K_ij_r[1]*K_ij_r[3] + K_ij_r[2]*K_ij_r[4]
+            KK_xz_r = K_ij_r[0]*K_ij_r[2] + K_ij_r[1]*K_ij_r[4] + K_ij_r[2]*K_ij_r[5]
+            KK_yy_r = K_ij_r[3]*K_ij_r[3] + K_ij_r[1]*K_ij_r[1] + K_ij_r[4]*K_ij_r[4]
+            KK_yz_r = K_ij_r[3]*K_ij_r[4] + K_ij_r[1]*K_ij_r[2] + K_ij_r[4]*K_ij_r[5]
+            KK_zz_r = K_ij_r[5]*K_ij_r[5] + K_ij_r[2]*K_ij_r[2] + K_ij_r[4]*K_ij_r[4]
+
+            K2_r = K_ij_r[0]**2 + K_ij_r[3]**2 + K_ij_r[5]**2 + 2.0*(K_ij_r[1]**2 + K_ij_r[2]**2 + K_ij_r[4]**2)
+            K2_over_3 = (K2_r / 3.0).astype(self.real_dtype)
+            
+            ### Traceless
+            KK_xx_r = KK_xx_r - K2_over_3
+            KK_yy_r = KK_yy_r - K2_over_3
+            KK_zz_r = KK_zz_r - K2_over_3
+            
+            KK_ij_r = jnp.stack([KK_xx_r, KK_xy_r, KK_xz_r, KK_yy_r, KK_yz_r, KK_zz_r], axis=0)
+            KK_ij_r = KK_ij_r - jnp.mean(KK_ij_r, axis=(1, 2, 3), keepdims=True)
+            G_ij_r = KK_ij_r - (1./3.)*dK_ij_r
+
+            T_r = (delta_r*delta_r - 1.5 * K2_r).astype(self.real_dtype)
+            T_ij_k = coord.apply_Gij_k(self.rfftn(T_r), self.kx, self.ky, self.kz)  # (6, nx, ny, nzr)
+            T_ij_k = coord.apply_traceless(T_ij_k)
+            T_ij_r = self._irfftn_vec(T_ij_k)  # (6, ng_L, ng_L, ng_L)
+            T_ij_r = T_ij_r - jnp.mean(T_ij_r, axis=(1, 2, 3), keepdims=True)
+
+            fields.extend([dK_ij_r, G_ij_r, T_ij_r])
 
         return jnp.array(fields)
 
@@ -310,19 +374,37 @@ class LPT_Forward(Base_Forward):
     def _assign_fields_from_disp_to_grid(
         self,
         disp_r: jnp.ndarray,      # (3, ng_L, ng_L, ng_L)
-        fields_r: jnp.ndarray,    # (m, ng_L, ng_L, ng_L)
+        fields_r: jnp.ndarray,    # (m, ng_L, ng_L, ng_L) for scalar or (m, 6, ng_L, ng_L, ng_L) for tensors
         *,
         interlace: bool = False,
         normalize_mean: bool = True,
+        field_type: Literal['scalar', 'tensor'] = 'scalar',
         neighbor_mode: str = 'auto',
         fuse_updates_threshold: int = 100_000_000,
     ) -> jnp.ndarray:
         """
-        Assign many real-space fields to Eulerian grid using either `for` or `vmap`.
-        Returns stacked real grids: (m, ng_E, ng_E, ng_E).
+        Assign many position-space fields to Eulerian grid using either `for` or `vmap`.
+
+        Returns
+        -------
+        fields_E : (n_out, ng_E, ng_E, ng_E) real
+            - If field_type == 'scalar': n_out = m
+            - If field_type == 'tensor': n_out = m * 6  (order = (xx,xy,xz,yy,yz,zz) per field, concatenated)
         """
-        m = int(fields_r.shape[0])
-        mode = self._get_assign_mode(m)
+        # --- Flatten tensor components into the leading axis if needed ---
+        if field_type == 'tensor':
+            if fields_r.ndim != 5 or fields_r.shape[1] != 6:
+                raise ValueError("For field_type='tensor', fields_r must have shape (m, 6, ng_L, ng_L, ng_L).")
+            m, c, nx, ny, nz = fields_r.shape
+            fields_flat_r = fields_r.reshape(m * c, nx, ny, nz)
+        else:
+            if fields_r.ndim != 4:
+                raise ValueError("For field_type='scalar', fields_r must have shape (m, ng_L, ng_L, ng_L).")
+            m, nx, ny, nz = fields_r.shape
+            fields_flat_r = fields_r
+
+        n_out = int(fields_flat_r.shape[0])
+        mode = self._get_assign_mode(n_out)
 
         if mode == "vmap":
             fn = lambda w: self.mesh.assign_from_disp_to_grid(
@@ -330,11 +412,11 @@ class LPT_Forward(Base_Forward):
                 neighbor_mode=neighbor_mode, fuse_updates_threshold=fuse_updates_threshold,
             )
             # vmap over field axis
-            fields = vmap(fn, in_axes=0, out_axes=0)(fields_r)
+            fields = vmap(fn, in_axes=0, out_axes=0)(fields_flat_r)
         else:
             fields = []
-            for i in range(m):
-                w = fields_r[i]
+            for i in range(n_out):
+                w = fields_flat_r[i]
                 gi = self.mesh.assign_from_disp_to_grid(
                     disp_r, w, interlace=interlace, normalize_mean=normalize_mean, 
                     neighbor_mode=neighbor_mode, fuse_updates_threshold=fuse_updates_threshold,
@@ -350,6 +432,7 @@ class LPT_Forward(Base_Forward):
         *,
         growth_f: float = 0.0,
         mode: str = 'k_space',
+        field_type: Literal['scalar', 'tensor'] = 'scalar',
         neighbor_mode: str = 'auto',
         fuse_updates_threshold: int=100_000_000,
     ) -> jnp.ndarray:
@@ -357,9 +440,14 @@ class LPT_Forward(Base_Forward):
         Build displacement (1LPT) and scalar real-space fields, assign them to Eulerian grid,
         and (optionally) FFT+deconvolve them in a single batched call.
 
-        Returns:
-          - mode=='k_space' : (n_fields, ng_E, ng_E, ng_E//2+1) complex
-          - else            : (n_fields, ng_E, ng_E, ng_E)       real
+        Returns
+        -------
+        If field_type == 'scalar':
+            - mode == 'k_space' : (m, ng_E, ng_E, ng_E//2+1), complex
+            - else              : (m, ng_E, ng_E, ng_E),       real
+        If field_type == 'tensor' (components in order xx,xy,xz,yy,yz,zz for each field):
+            - mode == 'k_space' : (m, 6, ng_E, ng_E, ng_E//2+1), complex
+            - else              : (m, 6, ng_E, ng_E, ng_E),       real
         """
         delta_k = delta_k.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
         delta_k_L = coord.func_extend(self.ng_L, delta_k)
@@ -368,30 +456,45 @@ class LPT_Forward(Base_Forward):
         disp_r_L = self.lpt(delta_k_L, growth_f=growth_f)  # (3, ng, ng, ng)
 
         # list of scalar fields in position space
-        fields_r_L = self._scalar_fields_r(delta_k_L)    # (m, ng_L, ng_L, ng_L)
+        if field_type == 'scalar':
+            fields_r_L = self._scalar_fields_r(delta_k_L)    # (m, ng_L, ng_L, ng_L)
+            m = int(fields_r_L.shape[0])
+        elif field_type == 'tensor':
+            fields_r_L = self._tensor_fields_r(delta_k_L)    # (m, 6, ng_L, ng_L, ng_L)
+            m = int(fields_r_L.shape[0])
+        else:
+            raise ValueError("field_type must be 'scalar' or 'tensor'.")
 
         # assign to Eularian grid (and FFT/deconv)
         if mode == 'k_space':
             # Build non-interlaced and (optionally) interlaced stacks
-            fields_E_r   = self._assign_fields_from_disp_to_grid(disp_r_L, fields_r_L,
+            fields_E_r  = self._assign_fields_from_disp_to_grid(disp_r_L, fields_r_L,
                                                                interlace=False, normalize_mean=True,
+                                                               field_type=field_type,
                                                                neighbor_mode=neighbor_mode,
                                                                fuse_updates_threshold=fuse_updates_threshold)
             fields_E_ri  = None
             if self.mesh.interlace:
                 fields_E_ri = self._assign_fields_from_disp_to_grid(disp_r_L, fields_r_L,
                                                                   interlace=True, normalize_mean=True,
+                                                                  field_type=field_type,
                                                                   neighbor_mode=neighbor_mode,
                                                                   fuse_updates_threshold=fuse_updates_threshold)
             # Single batched FFT + deconvolution (provided by Mesh_Assignment)
             fields_k = self.mesh.fft_deconvolve_batched(fields_E_r, fields_E_ri)
+            if field_type == 'tensor':
+                # Reshape back to (m, 6, ng_E, ng_E, ng_E//2+1)
+                fields_k = fields_k.reshape(m, 6, *fields_k.shape[1:])
             return fields_k.astype(self.complex_dtype)
         else:
             # Real-space: return non-interlaced assigned grids
             fields_E_r = self._assign_fields_from_disp_to_grid(disp_r_L, fields_r_L,
                                                              interlace=False, normalize_mean=True,
+                                                             field_type=field_type,
                                                              neighbor_mode=neighbor_mode,
                                                              fuse_updates_threshold=fuse_updates_threshold)
+            if field_type == 'tensor':
+                fields_E_r = fields_E_r.reshape(m, 6, *fields_E_r.shape[1:])
             return fields_E_r.astype(self.real_dtype)
         
     @partial(jit, static_argnames=('self', 'measure_pk'))
@@ -402,7 +505,7 @@ class LPT_Forward(Base_Forward):
         mu_edges: jnp.ndarray,         # (Nmu+1,)
         *,
         measure_pk,                    # Measure_Pk instance (static)
-        eps: float = 1e-20,
+        eps: float = 0.0,
     ) -> jnp.ndarray:
         """
         Compute beta_i(k,mu) = P( true, field_i ) / P( field_i, field_i )
@@ -525,29 +628,27 @@ class LPT_Forward(Base_Forward):
         return lax.fori_loop(0, n, loop, acc0)
     
     @partial(jit, static_argnames=('self',))
-    def _get_final_field_poly(
+    def _get_final_field_poly_grid(
         self,
         fields_k: jnp.ndarray,           # (n_fields, ng, ng, ng//2+1), complex
         coeffs: jnp.ndarray,             # (n_fields, Lk, Lmu), real
         k_pows: jnp.ndarray,             # (Lk,), int (exponents for k)
-        mu2_pows: jnp.ndarray,            # (Lmu,), int
+        mu_pows: jnp.ndarray,            # (Lmu,), int (exponents for mu)
     ) -> jnp.ndarray:
         """
-        Polynomial coefficients on (k,mu):
-            beta_i(k,mu) = sum_{a,b} coeffs[i,a,b] * (k**k_pows[a]) * (mu2**mu2_pows[b]),
+        Polynomial on the Cartesian product basis:
+        beta_i(k,mu) = sum_{a,b} coeffs[i,a,b] * (k**k_pows[a]) * (mu**mu_pows[b])
         """
         # Build k^2 and mu on the Eulerian rfft grid
         k2  = (self.kx2E[:, None, None] + self.ky2E[None, :, None] + self.kz2E[None, None, :]).astype(self.real_dtype)
-        mu2  = jnp.where(k2 > 0, self.kz2E[None, None, :] / k2, 0.0).astype(self.real_dtype)
-        base_k = jnp.sqrt(jnp.maximum(k2, 0.0)).astype(self.real_dtype)
+        kmag = jnp.sqrt(jnp.maximum(k2, 0.0)).astype(self.real_dtype)
+        mu   = jnp.where(k2 > 0, jnp.sqrt(self.kz2E[None, None, :] / k2), 0.0).astype(self.real_dtype)
 
-        # Precompute required powers for base_k and mu2:
-        # stacks: Kpow[a] = base_k ** k_pows[a],  Mpow[b] = mu2 ** mu2_pows[b]
-        Lk = k_pows.shape[0]
-        Lm = mu2_pows.shape[0]
+        # Precompute powers stacks
+        k_pows = k_pows.astype(jnp.int32);  mu_pows = mu_pows.astype(jnp.int32)
+        Lk = int(k_pows.shape[0]); Lm = int(mu_pows.shape[0])
 
         def build_pows(base, exps):
-            # Allocate (L, grid) and fill with base**exps[i]
             out0 = jnp.zeros((exps.shape[0],) + base.shape, dtype=self.real_dtype)
             def body(i, acc):
                 e = exps[i]
@@ -555,31 +656,113 @@ class LPT_Forward(Base_Forward):
                 return acc.at[i].set(val)
             return lax.fori_loop(0, exps.shape[0], body, out0)
 
-        Kpow = build_pows(base_k, k_pows.astype(jnp.int32))   # (Lk, grid)
-        Mpow = build_pows(mu2,    mu2_pows.astype(jnp.int32))  # (Lmu, grid)
+        Kpow = build_pows(kmag, k_pows)   # (Lk, grid)
+        Mpow = build_pows(mu,   mu_pows)  # (Lmu, grid)
 
         n_fields = fields_k.shape[0]
         coeffs = coeffs.astype(self.real_dtype)
-
-        acc0 = jnp.zeros_like(fields_k[0])  # complex
+        acc0 = jnp.zeros_like(fields_k[0])
 
         def loop_field(i, acc):
-            # Build beta_i(k,mu) on the fly to avoid storing a full (grid) per field.
-            # beta_i = sum_{a,b} coeffs[i,a,b] * Kpow[a] * Mpow[b]
             coef_i = coeffs[i]  # (Lk, Lmu)
-
-            # Accumulate over a, b with two nested loops.
-            beta_grid0 = jnp.zeros_like(base_k)  # real
+            beta_grid0 = jnp.zeros_like(kmag)
             def loop_a(a, beta_acc):
-                Ka = Kpow[a]  # grid
-                def loop_b(b, beta_acc2):
-                    Mb = Mpow[b]
-                    return beta_acc2 + coef_i[a, b] * Ka * Mb
-                beta_acc = lax.fori_loop(0, Lm, loop_b, beta_acc)
-                return beta_acc
-            beta_i_grid = lax.fori_loop(0, Lk, loop_a, beta_grid0)  # real, shape=grid
+                Ka = Kpow[a]
+                def loop_b(b, s):
+                    return s + coef_i[a, b] * Mpow[b]
+                s_ab = lax.fori_loop(0, Lm, loop_b, jnp.zeros_like(kmag))
+                return beta_acc + Ka * s_ab
+            beta_i_grid = lax.fori_loop(0, Lk, loop_a, beta_grid0)
+            return acc + beta_i_grid * fields_k[i]
 
-            return acc + beta_i_grid * fields_k[i]  # complex
+        return lax.fori_loop(0, n_fields, loop_field, acc0)
+    
+
+    @partial(jit, static_argnames=('self',))
+    def _get_final_field_poly_pair(
+        self,
+        fields_k: jnp.ndarray,           # (n_fields, ng, ng, ng//2+1), complex
+        coeffs: jnp.ndarray,             # (n_fields, L), real (pairwise terms)
+        k_pows: jnp.ndarray,             # (L,), int exponents for k (term-wise)
+        mu_pows: jnp.ndarray,            # (L,), int exponents for mu (term-wise)
+    ) -> jnp.ndarray:
+        """
+        Polynomial on a pairwise basis:
+        beta_i(k,mu) = sum_{t=0}^{L-1} coeffs[i,t] * (k**k_pows[t]) * (mu**mu_pows[t])
+
+        Notes
+        -----
+        - `k_pows` and `mu_pows` have the same length L and define each term.
+        - This matches `beta_polyfit(..., pairwise=True)` output directly.
+        """
+        # Build kmag and mu on the Eulerian rfft grid
+        k2  = (self.kx2E[:, None, None] + self.ky2E[None, :, None] + self.kz2E[None, None, :]).astype(self.real_dtype)
+        kmag = jnp.sqrt(jnp.maximum(k2, 0.0)).astype(self.real_dtype)
+        mu   = jnp.where(k2 > 0, jnp.sqrt(self.kz2E[None, None, :] / k2), 0.0).astype(self.real_dtype)
+
+        k_pows = k_pows.astype(jnp.int32)
+        mu_pows = mu_pows.astype(jnp.int32)
+        L = int(k_pows.shape[0])
+
+        # Precompute per-term powers to avoid recomputing inside the field loop
+        def build_terms(base, exps):
+            out0 = jnp.zeros((exps.shape[0],) + base.shape, dtype=self.real_dtype)
+            def body(t, acc):
+                e = exps[t]
+                val = jnp.where(e == 0, jnp.ones_like(base), base ** e)
+                return acc.at[t].set(val)
+            return lax.fori_loop(0, exps.shape[0], body, out0)
+
+        Kt = build_terms(kmag, k_pows)   # (L, grid)
+        Mt = build_terms(mu,   mu_pows)  # (L, grid)
+
+        n_fields = fields_k.shape[0]
+        coeffs = coeffs.astype(self.real_dtype)
+        acc0 = jnp.zeros_like(fields_k[0])
+
+        def loop_field(i, acc):
+            beta_grid = jnp.zeros_like(kmag)
+            def loop_term(t, b):
+                return b + coeffs[i, t] * Kt[t] * Mt[t]
+            beta_i = lax.fori_loop(0, L, loop_term, beta_grid)
+            return acc + beta_i * fields_k[i]
+
+        return lax.fori_loop(0, n_fields, loop_field, acc0)
+
+    @partial(jit, static_argnames=('self',))
+    def _get_final_field_poly_pair_perfield(
+        self,
+        fields_k: jnp.ndarray,            # (n_fields, ng, ng, ng//2+1), complex
+        coeffs: jnp.ndarray,              # (n_fields, Lmax), real (padded)
+        k_pows_2d: jnp.ndarray,           # (n_fields, Lmax), int
+        mu_pows_2d: jnp.ndarray,          # (n_fields, Lmax), int
+        term_mask: jnp.ndarray,           # (n_fields, Lmax), bool (True -> valid term)
+    ) -> jnp.ndarray:
+        """Pairwise basis where each field i has its own term list (padded to Lmax)."""
+        k2  = (self.kx2E[:, None, None] + self.ky2E[None, :, None] + self.kz2E[None, None, :]).astype(self.real_dtype)
+        kmag = jnp.sqrt(jnp.maximum(k2, 0.0)).astype(self.real_dtype)
+        mu   = jnp.where(k2 > 0, jnp.sqrt(self.kz2E[None, None, :] / k2), 0.0).astype(self.real_dtype)
+
+        n_fields, Lmax = coeffs.shape
+        coeffs = coeffs.astype(self.real_dtype)
+        k_pows_2d = k_pows_2d.astype(jnp.int32)
+        mu_pows_2d = mu_pows_2d.astype(jnp.int32)
+        term_mask_f = term_mask.astype(self.real_dtype)  # multiply as 0/1
+
+        acc0 = jnp.zeros_like(fields_k[0])
+
+        def loop_field(i, acc):
+            beta_grid = jnp.zeros_like(kmag)
+            def loop_term(t, b):
+                m = term_mask_f[i, t]
+                ek = k_pows_2d[i, t]
+                em = mu_pows_2d[i, t]
+                # if masked, contribute 0 without computing pow
+                Kt = jnp.where(m > 0, jnp.where(ek == 0, jnp.ones_like(kmag), kmag ** ek), 0.0)
+                Mt = jnp.where(m > 0, jnp.where(em == 0, jnp.ones_like(mu),   mu   ** em),  0.0)
+                return b + coeffs[i, t] * Kt * Mt
+            beta_i = lax.fori_loop(0, Lmax, loop_term, beta_grid)
+            return acc + beta_i * fields_k[i]
 
         return lax.fori_loop(0, n_fields, loop_field, acc0)
 
@@ -592,30 +775,26 @@ class LPT_Forward(Base_Forward):
         k_edges: jnp.ndarray | None = None,   # required for beta_kind='table'
         mu_edges: jnp.ndarray | None = None,  # required for beta_kind='table'
         poly_k_pows: jnp.ndarray | None = None,   # (Lk,), for beta_kind='poly'
-        poly_mu2_pows: jnp.ndarray | None = None,  # (Lmu,), for beta_kind='poly'
+        poly_mu_pows: jnp.ndarray | None = None,  # (Lmu,), for beta_kind='poly'
+        term_mask: jnp.ndarray | None = None,     # for 'poly' 2D-per-field
     ) -> jnp.ndarray:
         """
-        Build delta_g(k, mu) = sum_i beta_i(k,mu) * O_i(k,mu) with three beta modes:
+        Build delta_g(k,mu) = sum_i beta_i(k,mu) * O_i(k,mu) in three modes:
 
-        beta_kind='table':
-            beta: (n_fields, Nk, Nmu), nearest-bin lookup using (k_edges, mu_edges).
-
-        beta_kind='const':
-            beta: (n_fields,), constant per-field weights.
-
-        beta_kind='poly':
-            beta: (n_fields, Lk, Lmu) coefficients for a polynomial in k and mu.
-                  Provide poly_k_pows=(Lk,), poly_mu2_pows=(Lmu,).
-                  If use_k2=True, k-term uses (k^2)^p instead of k^p.
+        'table': beta is (n_fields, Nk, Nmu) and uses nearest-bin lookup.
+        'const': beta is (n_fields,) and is constant per field.
+        'poly' : polynomial in (k, mu).
+                 - If beta.ndim == 3: grid basis (coeffs: n x Lk x Lmu).
+                 - If beta.ndim == 2: pairwise basis (coeffs: n x L)  <-- pairwise=True
         """
-        # Sanity checks
+        if fields_k.shape[1] != self.ng_E:
+            raise ValueError(f"fields_k ng_E mismatch: got {fields_k.shape[1]}, expected {self.ng_E}")
+
         if beta_kind == 'table':
             if k_edges is None or mu_edges is None:
                 raise ValueError("beta_kind='table' requires k_edges and mu_edges.")
             if beta.ndim != 3:
                 raise ValueError("For beta_kind='table', beta must have shape (n_fields, Nk, Nmu).")
-
-            # Build/reuse the grid -> (k,mu) bin mapping and run the table kernel.
             self._ensure_nearest_cache(k_edges, mu_edges)
             return self._get_final_field_table(fields_k, beta)
 
@@ -625,11 +804,24 @@ class LPT_Forward(Base_Forward):
             return self._get_final_field_const(fields_k, beta)
 
         elif beta_kind == 'poly':
-            if beta.ndim != 3:
-                raise ValueError("For beta_kind='poly', beta must have shape (n_fields, Lk, Lmu).")
-            if poly_k_pows is None or poly_mu2_pows is None:
+            if poly_k_pows is None or poly_mu_pows is None:
                 raise ValueError("For beta_kind='poly', provide poly_k_pows and poly_mu_pows.")
-            return self._get_final_field_poly(fields_k, beta, poly_k_pows, poly_mu2_pows)
-
+            # grid-form (Cartesian product): beta is (n, Lk, Lmu) and pows are 1D
+            if beta.ndim == 3:
+                if poly_k_pows.ndim != 1 or poly_mu_pows.ndim != 1:
+                    raise ValueError("Grid basis expects 1D poly_k_pows / poly_mu_pows.")
+                return self._get_final_field_poly_grid(fields_k, beta, poly_k_pows, poly_mu_pows)
+            # pairwise-form (global terms): beta is (n, L) and pows are 1D
+            if beta.ndim == 2 and poly_k_pows.ndim == 1 and poly_mu_pows.ndim == 1:
+                return self._get_final_field_poly_pair(fields_k, beta, poly_k_pows, poly_mu_pows)
+            # pairwise-form (per-field terms): beta is (n, Lmax) and pows are 2D
+            if beta.ndim == 2 and poly_k_pows.ndim == 2 and poly_mu_pows.ndim == 2:
+                if poly_k_pows.shape != beta.shape or poly_mu_pows.shape != beta.shape:
+                    raise ValueError("Per-field pairwise expects shapes: beta, poly_k_pows, poly_mu_pows all (n,Lmax).")
+                if term_mask is None:
+                    # by default, use exponent >= 0 as 'valid'
+                    term_mask = (poly_k_pows >= 0) & (poly_mu_pows >= 0)
+                return self._get_final_field_poly_pair_perfield(fields_k, beta, poly_k_pows, poly_mu_pows, term_mask)
+            raise ValueError("Unsupported 'poly' shapes combination.")
         else:
             raise ValueError(f"Unknown beta_kind='{beta_kind}'")

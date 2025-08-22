@@ -81,6 +81,20 @@ def apply_gauss_k(delta_k, R, kx, ky, kz):
     W  = jnp.exp(-0.5 * k2 * (jnp.asarray(R, dtype=rtype)**2))
     return delta_k * W.astype(ctype)
 
+@jit
+def apply_traceless(Gij_k):
+    """Traceless part of G_ij: G_ij - (1/3) \delta_ij G_kk."""
+    # G_kk = G_xx + G_yy + G_zz
+    g_xx, g_xy, g_xz, g_yy, g_yz, g_zz = Gij_k
+    g_trace = (g_xx + g_yy + g_zz) / 3.0
+
+    # Subtract trace from diagonal components
+    g_xx -= g_trace
+    g_yy -= g_trace
+    g_zz -= g_trace
+
+    return jnp.stack([g_xx, g_xy, g_xz, g_yy, g_yz, g_zz], axis=0)
+
 # ==========================================
 # 3D k-vector interfaces
 # ==========================================
