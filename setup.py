@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="PT_field",
-    version="0.2.1",
+    version="0.3.0",
     description="Perturbative forward modeling at the field level",
     author="Kazuyuki Akitsu",
     url="https://github.com/kazakitsu/PT-field-modeling",
