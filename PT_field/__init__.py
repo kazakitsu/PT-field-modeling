@@ -23,7 +23,7 @@ if use_jax:
         low_pass_filter_fourier,
         high_pass_filter_fourier,
     )
-    from .forward_model_jax import Base_Forward, LPT_Forward
+    from .forward_model_jax import Base_Forward, LPT_Forward, EPT_Forward
     from .utils_jax import growth_D_f, orthogonalize, beta_polyfit, compute_corr_2d, check_max_rij, compute_pks_2d
 else:  ### to be implemented
     from .coord import (
@@ -40,7 +40,7 @@ else:  ### to be implemented
         low_pass_filter_fourier,
         high_pass_filter_fourier,
     )
-    from .forward_model import Base_Forward, LPT_Forward
+    from .forward_model import Base_Forward, LPT_Forward, EPT_Forward
     from .utils import growth_D_f, orthogonalize, beta_polyfit, compute_corr_2d, check_max_rij, compute_pks_2d
 
 __all__ = [
@@ -59,6 +59,7 @@ __all__ = [
     "high_pass_filter_fourier",
     "Base_Forward",
     "LPT_Forward",
+    "EPT_Forward",
     "orthogonalize",
     "beta_polyfit",
     "check_max_rij",

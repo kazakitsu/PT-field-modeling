@@ -177,48 +177,83 @@ def rfftn_Gij(kvec):
 # Grid manipulation & Hermitian symmetry
 # =======================================
 
+# ---------- extend: single-scatter version ----------
 @partial(jit, static_argnames=('ng_ext',))
 def func_extend(ng_ext, array_3d):
-    """Zero-pad Fourier rfftn layout array to a larger ng_ext."""
+    """
+    Zero-pad an rfftn-layout array to a larger grid (ng_ext) with one scatter.
+    We gather the source "low-k" planes with explicit index arrays along x/y,
+    then place them into the destination low-k slots.
+    """
     ng = array_3d.shape[0]
-    ng_half = ng // 2
+    half = ng // 2
+
+    # source indices (x,y): [0..half-1, ng-half..ng-1]  (length = ng)
+    idx_src_xy = jnp.concatenate([jnp.arange(half), jnp.arange(ng - half, ng)])
+    # dest indices (x,y):   [0..half-1, ng_ext-half..ng_ext-1] (length = ng)
+    idx_dst_xy = jnp.concatenate([jnp.arange(half), jnp.arange(ng_ext - half, ng_ext)])
+
+    # z: copy only the available half-spectrum 0..ng//2
+    idx_src_z = jnp.arange(ng // 2 + 1)
+    idx_dst_z = idx_src_z  # same length, placed at low-z
+
+    # gather once, then scatter once
+    src = array_3d[jnp.ix_(idx_src_xy, idx_src_xy, idx_src_z)]
     out = jnp.zeros((ng_ext, ng_ext, ng_ext // 2 + 1), dtype=array_3d.dtype)
-
-    src_pos_x, dst_pos_x = slice(0, ng_half), slice(0, ng_half)
-    src_neg_x, dst_neg_x = slice(-ng_half, None), slice(-ng_half, None)
-    idx_y = jnp.r_[0:ng_half, ng_ext - ng_half:ng_ext]
-    idx_z = slice(0, ng // 2 + 1)
-
-    out = out.at[dst_pos_x, idx_y, idx_z].set(array_3d[src_pos_x, :, :])
-    out = out.at[dst_neg_x, idx_y, idx_z].set(array_3d[src_neg_x, :, :])
+    out = out.at[jnp.ix_(idx_dst_xy, idx_dst_xy, idx_dst_z)].set(src)
     return out
 
+# ---------- reduce ----------
 @partial(jit, static_argnames=('ng_red',))
 def func_reduce(ng_red, array_3d):
-    """Truncate high-k modes in rfftn layout to reduce grid size to ng_red."""
+    """
+    Truncate high-k modes in rfftn layout to reduce grid size to ng_red.
+    Kept band is the same as func_extend's low-k region.
+    """
     ng = array_3d.shape[0]
     half = ng_red // 2
     idx_xy = jnp.concatenate([jnp.arange(half), jnp.arange(ng - half, ng)])
     idx_z  = jnp.arange(half + 1)
     return array_3d[jnp.ix_(idx_xy, idx_xy, idx_z)]
 
+# ---------- enforce Hermitian: vectorized ----------
 @jit
 def _enforce_hermite(array_k):
-    """Ensure corner/axis Hermitian constraints in rfftn layout."""
-    ng = array_k.shape[0]
-    half = ng // 2
+    """
+    Enforce corner/axis Hermitian constraints for rfftn layout:
+      - make specific corners purely real on z=0 and z=Nyq (last z-plane),
+      - fix a minimal set of 1D-conjugate pairs along axes.
+    Notes
+    -----
+    - rfftn/irfftn normally maintains Hermitian symmetry; this is a safe fix
+      after manual slicing/reduction.
+    """
     x = array_k
-    # make specific corners real
-    for zidx in (0, -1):
-        x = x.at[0, 0, zidx].set(x[0, 0, zidx].real)
-        x = x.at[half, 0, zidx].set(x[half, 0, zidx].real)
-        x = x.at[0, half, zidx].set(x[0, half, zidx].real)
-        x = x.at[half, half, zidx].set(x[half, half, zidx].real)
-    # conjugate sym along axes (minimal fix; full symmetry relies on using rfftn/irfftn)
-    x = x.at[0, -1:half:-1, 0].set(x[0, 1:half, 0].conj())
-    x = x.at[-1:half:-1, 0, 0].set(x[1:half, 0, 0].conj())
-    x = x.at[0, -1:half:-1, -1].set(x[0, 1:half, -1].conj())
-    x = x.at[-1:half:-1, 0, -1].set(x[1:half, 0, -1].conj())
+    ng = x.shape[0]
+    half = ng // 2
+    lastz = x.shape[2] - 1  # Nyquist z-plane
+
+    # -- make the four corners on z=0 and z=Nyq purely real --
+    def realify_corners(zidx, x):
+        ii = jnp.array([0,     half,  0,     half], dtype=jnp.int32)
+        jj = jnp.array([0,     0,     half,  half], dtype=jnp.int32)
+        kk = jnp.full_like(ii, zidx)
+        vals = jnp.real(x[ii, jj, kk]).astype(x.dtype)  # zero imag
+        return x.at[ii, jj, kk].set(vals)
+
+    x = realify_corners(0, x)
+    x = realify_corners(lastz, x)
+
+    # -- 1D axis-conjugate fixes for a minimal set of lines --
+    # y-axis line at x=0 on z=0 and z=Nyq:
+    y = jnp.arange(1, half, dtype=jnp.int32)  # 1..half-1
+    x = x.at[0, -y, 0].set(jnp.conj(x[0, y, 0]))
+    x = x.at[0, -y, lastz].set(jnp.conj(x[0, y, lastz]))
+
+    # x-axis line at y=0 on z=0 and z=Nyq:
+    x = x.at[-y, 0, 0].set(jnp.conj(x[y, 0, 0]))
+    x = x.at[-y, 0, lastz].set(jnp.conj(x[y, 0, lastz]))
+
     return x
 
 @partial(jit, static_argnames=('ng_red',))
@@ -232,51 +267,67 @@ def func_reduce_hermite(ng_red, array_3d):
 
 @partial(jit, static_argnames=('cutoff',))
 def _apply_cubic_low_pass_filter(cutoff, array_3d):
+    """
+    Cubic low-pass via 1D boolean masks and broadcasting.
+    Keeps x/y indices in [0..half-1] or [ng-half..ng-1] and z in [0..half].
+    Equivalent passband to the original slice-based implementation.
+    """
     ng = array_3d.shape[0]
-    half = int(cutoff) // 2
-    out = jnp.zeros_like(array_3d)
-    idx_xy = jnp.concatenate([jnp.arange(half), jnp.arange(ng - half, ng)])
-    idx_z  = jnp.arange(half + 1)
-    sl = jnp.ix_(idx_xy, idx_xy, idx_z)
-    return out.at[sl].set(array_3d[sl])
+    half = int(cutoff) // 2  # e.g., cutoff = 2*ng//3 -> half = ng//3
+
+    idx_xy = jnp.arange(ng)
+    mx = (idx_xy < half) | (idx_xy >= (ng - half))      # (ng,)
+    mz = jnp.arange(ng // 2 + 1) <= half                # (ng//2+1,)
+
+    mask = (mx[:, None, None] & mx[None, :, None] & mz[None, None, :])
+    return array_3d * mask.astype(array_3d.dtype)
 
 @jit
-def _apply_spherical_low_pass_filter(k_cutoff, array_3d, kvec):
-    k2 = jnp.sum(kvec**2, axis=0)
-    return array_3d * (k2 <= (k_cutoff**2))
+def _apply_spherical_low_pass_filter(k_cutoff, array_3d, kx, ky, kz):
+    k2 = (kx*kx)[:, None, None] + (ky*ky)[None, :, None] + (kz*kz)[None, None, :]
+    mask = (k2 <= (jnp.asarray(k_cutoff, dtype=k2.dtype)**2))
+    return array_3d * mask.astype(array_3d.dtype)
 
 @partial(jit, static_argnames=('cutoff',))
 def _apply_cubic_high_pass_filter(cutoff, array_3d):
+    """
+    Cubic high-pass as complement of the above low-pass.
+    """
     ng = array_3d.shape[0]
     half = int(cutoff) // 2
-    idx_xy = jnp.concatenate([jnp.arange(half), jnp.arange(ng - half, ng)])
-    idx_z  = jnp.arange(half + 1)
-    sl = jnp.ix_(idx_xy, idx_xy, idx_z)
-    return array_3d.at[sl].set(0)
+
+    idx_xy = jnp.arange(ng)
+    mx = (idx_xy < half) | (idx_xy >= (ng - half))      # kept by low-pass
+    mz = jnp.arange(ng // 2 + 1) <= half
+
+    # complement mask
+    mask = ~(mx[:, None, None] & mx[None, :, None] & mz[None, None, :])
+    return array_3d * mask.astype(array_3d.dtype)
 
 @jit
-def _apply_spherical_high_pass_filter(k_cutoff, array_3d, kvec):
-    k2 = jnp.sum(kvec**2, axis=0)
-    return array_3d * (k2 > (k_cutoff**2))
+def _apply_spherical_high_pass_filter(k_cutoff, array_3d, kx, ky, kz):
+    k2 = (kx*kx)[:, None, None] + (ky*ky)[None, :, None] + (kz*kz)[None, None, :]
+    mask = (k2 >= (jnp.asarray(k_cutoff, dtype=k2.dtype)**2))
+    return array_3d * mask.astype(array_3d.dtype)
 
-def low_pass_filter_fourier(filter_type, cutoff_param, array_3d, kvec=None):
+def low_pass_filter_fourier(filter_type, cutoff_param, array_3d, kx=None, ky=None, kz=None):
     """Apply sharp low-pass filter in Fourier space ('cubic' or 'spherical')."""
     if filter_type == 'cubic':
         return _apply_cubic_low_pass_filter(cutoff_param, array_3d)
     elif filter_type == 'spherical':
-        if kvec is None:
-            raise ValueError("kvec must be provided for the spherical filter.")
-        return _apply_spherical_low_pass_filter(cutoff_param, array_3d, kvec)
+        if kx is None or ky is None or kz is None:
+            raise ValueError("kx, ky and kz must be provided for the spherical filter.")
+        return _apply_spherical_low_pass_filter(cutoff_param, array_3d, kx, ky, kz)
     else:
         raise ValueError("filter_type must be 'cubic' or 'spherical'")
 
-def high_pass_filter_fourier(filter_type, cutoff_param, array_3d, kvec=None):
+def high_pass_filter_fourier(filter_type, cutoff_param, array_3d, kx=None, ky=None, kz=None):
     """Apply sharp high-pass filter in Fourier space ('cubic' or 'spherical')."""
     if filter_type == 'cubic':
         return _apply_cubic_high_pass_filter(cutoff_param, array_3d)
     elif filter_type == 'spherical':
-        if kvec is None:
-            raise ValueError("kvec must be provided for the spherical filter.")
-        return _apply_spherical_high_pass_filter(cutoff_param, array_3d, kvec)
+        if kx is None or ky is None or kz is None:
+            raise ValueError("kx, ky and kz must be provided for the spherical filter.")
+        return _apply_spherical_high_pass_filter(cutoff_param, array_3d, kx, ky, kz)
     else:
         raise ValueError("filter_type must be 'cubic' or 'spherical'")
