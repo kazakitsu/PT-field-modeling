@@ -610,6 +610,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
         lya: bool = False,
         lpt_order: int = 1,
         bias_order: int = 2,
+        renormalize: bool = True,
         dtype=jnp.float32,
         max_scatter_indices: int = 200_000_000,
         use_batched_fft: bool = True,
@@ -634,6 +635,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
         self.lya = bool(lya)
         self.lpt_order = int(lpt_order)
         self.bias_order = int(bias_order)
+        self.renormalize = bool(renormalize)
 
         # Assignment switching policy
         self.assign_mode: Literal["auto", "for", "vmap"] = assign_mode
@@ -657,12 +659,12 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
     @partial(jit, static_argnames=('self',))
     def lpt(self, delta_k_L: jnp.ndarray, growth_f: float = 0.0) -> jnp.ndarray:
         delta_k_L = delta_k_L.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
-        disp1_k = coord.apply_disp_k(delta_k_L, self.kx, self.ky, self.kz).astype(self.complex_dtype)
-        disp1_r = self._irfftn_vec(disp1_k).astype(self.real_dtype)
+        disp_k = coord.apply_disp_k(delta_k_L, self.kx, self.ky, self.kz).astype(self.complex_dtype)
+        disp_r = self._irfftn_vec(disp_k).astype(self.real_dtype)
         if self.rsd:
             gf = jnp.asarray(growth_f, dtype=self.real_dtype)
-            disp1_r = disp1_r.at[2].add(disp1_r[2] * gf)
-        return disp1_r  # (3, ng, ng, ng)
+            disp_r = disp_r.at[2].add(disp_r[2] * gf)
+        return disp_r  # (3, ng, ng, ng)
 
     # -------- scalar fields in position space -------
     @partial(jit, static_argnames=('self',))
@@ -679,7 +681,9 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
             fields.append(delta_r)
 
         if self.bias_order >= 2:
-            d2_r = delta_r**2 - jnp.mean(delta_r**2)
+            d2_r = delta_r**2
+            sigma2 = jnp.mean(delta_r**2)
+            d2_r = d2_r - sigma2
 
             Gij_k = coord.apply_Gij_k(delta_k, self.kx, self.ky, self.kz)  # (6, ...)
             Gij_r = self._irfftn_vec(Gij_k)  # real
@@ -710,6 +714,31 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
                 KK_zz_r = GG_zz_r - (2.0/3.0) * deta_r + (1.0/9.0) * d2_r
                 KK_zz_r = KK_zz_r - jnp.mean(KK_zz_r)
                 fields.extend([eta2_r, deta_r, KK_zz_r])
+
+        if self.bias_order >= 3:
+            d3_r = delta_r**3
+            # G2d
+            G2d_r = G2_r * delta_r
+
+            # G3
+            ### - Det(Gij_r)
+            phi3a_r = G1j_r[0]*Gij_r[4]*Gij_r[4] + Gij_r[3]*Gij_r[2]*Gij_r[2] + Gij_r[5]*Gij_r[1]*Gij_r[1] - 2.0*Gij_r[1]*Gij_r[2]*Gij_r[4] - Gij_r[0]*Gij_r[3]*Gij_r[5]
+            G3_r    = 3.0*phi3a_r
+
+            # Gamma3
+            G2_k    = self.rfftn(G2_r)
+            G2ij_k  = coord.apply_Gij_k(G2_k, self.kx, self.ky, self.kz)  # (6, ...)
+            G2ij_r  = self._irfftn_vec(G2ij_k)
+            phi3b_r = 0.5*Gij_r[0]*(G2ij_r[3]+G2ij_r[5]) + 0.5*Gij_r[3]*(G2ij_r[0]+G2ij_r[5]) + 0.5*Gij_r[5]*(G2ij_r[0]+G2ij_r[3]) - Gij_r[1]*G2ij_r[1] - Gij_r[2]*G2ij_r[2] - Gij_r[4]*G2ij_r[4]
+            ### multiplying -10./21. results in one of the third order potential in LPT
+            ### Gamma3 = -8/7 \phi^(3b)
+            Gamma3_r = -8./7.*phi3b_r
+
+            if self.renormalize:
+                d3r_L = d3r_L - 3.0*sigma2*delr_L
+                G2dr_L = G2dr_L + 4./3.*sigma2*delr_L
+
+            fields.extend([d3_r - jnp.mean(d3_r), G2d_r - jnp.mean(G2d_r), G3_r - jnp.mean(G3_r), Gamma3_r - jnp.mean(Gamma3_r)])
 
         return jnp.array(fields)
     
@@ -976,6 +1005,16 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
             m = int(fields_r_L.shape[0])
         else:
             raise ValueError("field_type must be 'scalar' or 'tensor'.")
+
+        # 2lpt correction
+        if self.lpt_order >= 2:
+            if field_type != 'scalar':
+                raise NotImplementedError("2LPT correction only implemented for field_type='scalar'.")
+            if self.bias_order < 2:
+                G2_k_L = self.G2_k(delta_k_L)
+            else:
+                G2_k_L = self.rfftn(fields_r_L[3])
+            disp_r_L = disp_r_L - (3./14.) * self.lpt(G2_k_L, growth_f=growth_f).astype(self.real_dtype)
 
         # assign to Eularian grid (and FFT/deconv)
         if mode == 'k_space':
