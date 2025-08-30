@@ -722,7 +722,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
 
             # G3
             ### - Det(Gij_r)
-            phi3a_r = G1j_r[0]*Gij_r[4]*Gij_r[4] + Gij_r[3]*Gij_r[2]*Gij_r[2] + Gij_r[5]*Gij_r[1]*Gij_r[1] - 2.0*Gij_r[1]*Gij_r[2]*Gij_r[4] - Gij_r[0]*Gij_r[3]*Gij_r[5]
+            phi3a_r = Gij_r[0]*Gij_r[4]*Gij_r[4] + Gij_r[3]*Gij_r[2]*Gij_r[2] + Gij_r[5]*Gij_r[1]*Gij_r[1] - 2.0*Gij_r[1]*Gij_r[2]*Gij_r[4] - Gij_r[0]*Gij_r[3]*Gij_r[5]
             G3_r    = 3.0*phi3a_r
 
             # Gamma3
@@ -735,8 +735,8 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
             Gamma3_r = -8./7.*phi3b_r
 
             if self.renormalize:
-                d3r_L = d3r_L - 3.0*sigma2*delr_L
-                G2dr_L = G2dr_L + 4./3.*sigma2*delr_L
+                d3_r = d3_r - 3.0*sigma2*delta_r
+                G2d_r = G2d_r + 4./3.*sigma2*delta_r
 
             fields.extend([d3_r - jnp.mean(d3_r), G2d_r - jnp.mean(G2d_r), G3_r - jnp.mean(G3_r), Gamma3_r - jnp.mean(Gamma3_r)])
 
