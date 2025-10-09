@@ -26,7 +26,7 @@ Core ideas:
 
 - **LPT-based forward model (`LPT_Forward`)**
   - LPT displacement in real space, with optional **RSD**: $\psi_z \rightarrow \psi_z (1 + f)$.
-  - Scalar field builders up to **quadratic** order: $1, \delta, \delta^2, {\mathcal{G}_2}$
+  - Scalar field builders up to **cubic** order: $1, \delta, \delta^2, {\mathcal{G}_2}, \delta^3, \delta{\mathcal{G}_2}, {\mathcal{G}_3}, {\Gamma_3}$
     - With `rsd=True`, also builds ${\mathcal{G}^{\parallel}_{2}}$.  
     - With `lya=True`, also builds $\eta$-related helpers: $\eta^2$, $\delta\eta$, $KK^{\parallel}$.
   - Tensor field builders up to **quadratic** order: $K_{ij}, \delta K_{ij}, H_{ij}, T_{ij}$

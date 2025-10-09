@@ -711,14 +711,19 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
                 GG_zz_r = (Gij_r[2]**2 + Gij_r[4]**2 + Gij_r[5]**2)
                 GG_zz_r = GG_zz_r - jnp.mean(GG_zz_r)
 
-                KK_zz_r = GG_zz_r - (2.0/3.0) * deta_r + (1.0/9.0) * d2_r
+                KK_zz_r = GG_zz_r - (2./3.) * deta_r + (1./9.) * d2_r
                 KK_zz_r = KK_zz_r - jnp.mean(KK_zz_r)
-                fields.extend([eta2_r, deta_r, KK_zz_r])
+
+                ### degenerate operators
+                pi_zz_r = GG_zz_r - 5./7 * G2_zz_r
+                #fields.extend([eta2_r, deta_r, KK_zz_r])
+                fields.extend([eta2_r, deta_r, KK_zz_r, 
+                               eta_r, pi_zz_r])
 
         if self.bias_order >= 3:
             d3_r = delta_r**3
-            # G2d
-            G2d_r = G2_r * delta_r
+            # dG2
+            dG2_r = delta_r * G2_r
 
             # G3
             ### - Det(Gij_r)
@@ -735,10 +740,13 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
             Gamma3_r = -8./7.*phi3b_r
 
             if self.renormalize:
-                d3_r = d3_r - 3.0*sigma2*delta_r
-                G2d_r = G2d_r + 4./3.*sigma2*delta_r
+                d3_r  = d3_r - 3.*sigma2*delta_r
+                dG2_r = dG2_r + 4./3.*sigma2*delta_r
 
-            fields.extend([d3_r - jnp.mean(d3_r), G2d_r - jnp.mean(G2d_r), G3_r - jnp.mean(G3_r), Gamma3_r - jnp.mean(Gamma3_r)])
+            fields.extend([d3_r - jnp.mean(d3_r), 
+                           dG2_r - jnp.mean(dG2_r), 
+                           G3_r - jnp.mean(G3_r), 
+                           Gamma3_r - jnp.mean(Gamma3_r)])
 
         return jnp.array(fields)
     
@@ -746,7 +754,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
     @partial(jit, static_argnames=('self',))
     def _tensor_fields_r(self, delta_k: jnp.ndarray) -> jnp.ndarray:
         r"""
-        Build tensor fields in position space: [K_ij, dK_ij, G_ij, T_ij, ...]
+        Build tensor fields in position space: [K_ij, dK_ij, H_ij, T_ij, ...]
         Returns
         -------
         (n_fields, 6, ng, ng, ng) with order (xx,xy,xz,yy,yz,zz) in the 6-axis.
@@ -794,7 +802,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
             
             KK_ij_r = jnp.stack([KK_xx_r, KK_xy_r, KK_xz_r, KK_yy_r, KK_yz_r, KK_zz_r], axis=0)
             KK_ij_r = KK_ij_r - jnp.mean(KK_ij_r, axis=(1, 2, 3), keepdims=True)
-            G_ij_r = KK_ij_r - (1./3.)*dK_ij_r
+            H_ij_r = KK_ij_r - (1./3.)*dK_ij_r
 
             T_r = (delta_r*delta_r - 1.5 * K2_r).astype(self.real_dtype)
             T_ij_k = coord.apply_Gij_k(self.rfftn(T_r), self.kx, self.ky, self.kz)  # (6, nx, ny, nzr)
@@ -802,7 +810,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
             T_ij_r = self._irfftn_vec(T_ij_k)  # (6, ng_L, ng_L, ng_L)
             T_ij_r = T_ij_r - jnp.mean(T_ij_r, axis=(1, 2, 3), keepdims=True)
 
-            fields.extend([dK_ij_r, G_ij_r, T_ij_r])
+            fields.extend([dK_ij_r, H_ij_r, T_ij_r])
 
         return jnp.array(fields)
 
@@ -900,6 +908,88 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
     def KK_zz_k(self, delta_k_L):
         return self.rfftn(self.KK_zz_r(delta_k_L))
     
+    @partial(jit, static_argnames=('self',))
+    def Kij_k(self, delta_k_L):
+        delta_k_L = delta_k_L.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
+        
+        K_ij_k = coord.apply_Gij_k(delta_k_L, self.kx, self.ky, self.kz)  # (6, ng_L, ng_L, ng_L//2+1)
+        K_ij_k = coord.apply_traceless(K_ij_k)
+
+        return K_ij_k
+    
+    @partial(jit, static_argnames=('self',))
+    def Kij_r(self, delta_k_L):
+        K_ij_k = self.Kij_k(delta_k_L)
+        K_ij_r = self._irfftn_vec(K_ij_k)  # (6, ng_L, ng_L, ng_L)
+        return K_ij_r
+    
+    @partial(jit, static_argnames=('self',))
+    def dKij_r(self, delta_k_L):
+        delta_k_L = delta_k_L.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
+        K_ij_r = self.Kij_r(delta_k_L)
+
+        delta_r = self.irfftn(delta_k_L)
+
+        dK_ij_r = K_ij_r * delta_r[None, :, :, :]  # (6, ng_L, ng_L, ng_L)
+        dK_ij_r = dK_ij_r - jnp.mean(dK_ij_r, axis=(1, 2, 3), keepdims=True)
+        return dK_ij_r
+    
+    @partial(jit, static_argnames=('self',))
+    def dKij_k(self, delta_k_L):
+        return self._rfftn_vec(self.dKij_r(delta_k_L))
+    
+    @partial(jit, static_argnames=('self',))
+    def Hij_r(self, delta_k_L):
+        delta_k_L = delta_k_L.at[0,0,0].set(0.0).astype(self.complex_dtype)
+        K_ij_r = self.Kij_r(delta_k_L)
+        delta_r = self.irfftn(delta_k_L)
+        dK_ij_r = K_ij_r * delta_r[None, :, :, :]  # (6, ng_L, ng_L, ng_L)
+        dK_ij_r = dK_ij_r - jnp.mean(dK_ij_r, axis=(1, 2, 3), keepdims=True)
+
+        KK_xx_r = K_ij_r[0]*K_ij_r[0] + K_ij_r[1]*K_ij_r[1] + K_ij_r[2]*K_ij_r[2]
+        KK_xy_r = K_ij_r[0]*K_ij_r[1] + K_ij_r[1]*K_ij_r[3] + K_ij_r[2]*K_ij_r[4]
+        KK_xz_r = K_ij_r[0]*K_ij_r[2] + K_ij_r[1]*K_ij_r[4] + K_ij_r[2]*K_ij_r[5]
+        KK_yy_r = K_ij_r[3]*K_ij_r[3] + K_ij_r[1]*K_ij_r[1] + K_ij_r[4]*K_ij_r[4]
+        KK_yz_r = K_ij_r[3]*K_ij_r[4] + K_ij_r[1]*K_ij_r[2] + K_ij_r[4]*K_ij_r[5]
+        KK_zz_r = K_ij_r[5]*K_ij_r[5] + K_ij_r[2]*K_ij_r[2] + K_ij_r[4]*K_ij_r[4]
+
+        K2_r = K_ij_r[0]**2 + K_ij_r[3]**2 + K_ij_r[5]**2 + 2.0*(K_ij_r[1]**2 + K_ij_r[2]**2 + K_ij_r[4]**2)
+        K2_over_3 = (K2_r / 3.0).astype(self.real_dtype)
+            
+        ### Traceless
+        KK_xx_r = KK_xx_r - K2_over_3
+        KK_yy_r = KK_yy_r - K2_over_3
+        KK_zz_r = KK_zz_r - K2_over_3
+            
+        KK_ij_r = jnp.stack([KK_xx_r, KK_xy_r, KK_xz_r, KK_yy_r, KK_yz_r, KK_zz_r], axis=0)
+        KK_ij_r = KK_ij_r - jnp.mean(KK_ij_r, axis=(1, 2, 3), keepdims=True)
+        H_ij_r = KK_ij_r - (1./3.)*dK_ij_r
+
+        return H_ij_r
+    
+    @partial(jit, static_argnames=('self',))
+    def Hij_k(self, delta_k_L):
+        return self._rfftn_vec(self.Hij_r(delta_k_L))
+    
+    @partial(jit, static_argnames=('self',))
+    def Tij_r(self, delta_k_L):
+        delta_k_L = delta_k_L.at[0,0,0].set(0.0).astype(self.complex_dtype)
+        K_ij_r = self.Kij_r(delta_k_L)
+        delta_r = self.irfftn(delta_k_L)
+        K2_r = K_ij_r[0]**2 + K_ij_r[3]**2 + K_ij_r[5]**2 + 2.0*(K_ij_r[1]**2 + K_ij_r[2]**2 + K_ij_r[4]**2)
+        
+        T_r = (delta_r*delta_r - 1.5 * K2_r).astype(self.real_dtype)
+        T_ij_k = coord.apply_Gij_k(self.rfftn(T_r), self.kx, self.ky, self.kz)  # (6, nx, ny, nzr)
+        T_ij_k = coord.apply_traceless(T_ij_k)
+        T_ij_r = self._irfftn_vec(T_ij_k)  # (6, ng_L, ng_L, ng_L)
+        T_ij_r = T_ij_r - jnp.mean(T_ij_r, axis=(1, 2, 3), keepdims=True)
+
+        return T_ij_r
+    
+    @partial(jit, static_argnames=('self',))
+    def Tij_k(self, delta_k_L):
+        return self._rfftn_vec(self.Tij_r(delta_k_L))
+
     # -------------------- assignment policy helpers --------------------
     def _get_assign_mode(self, n_fields: int) -> Literal["for", "vmap"]:
         """Pick assignment strategy (`for` or `vmap`) under `assign_mode` policy."""
@@ -1133,6 +1223,7 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
             F2_r = (d2_r - shift2_r + (2.0/7.0) * G2_r).astype(self.real_dtype)
             F2_k = self.rfftn(F2_r).astype(self.complex_dtype)
             fields[0] = (fields[0] + F2_k)  # delta_k += F2_k
+            fields[0] = fields[0].at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
         elif self.pt_order > 2:
             delta_m_r_ = self.gridspt(delta_k, pt_order=self.pt_order, ng=int(2.*self.ng_L/3))
             delta_m_r = jnp.sum(delta_m_r_, axis=0)  # sum over pt_order
@@ -1191,16 +1282,16 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
             
             KK_ij_r = jnp.stack([KK_xx_r, KK_xy_r, KK_xz_r, KK_yy_r, KK_yz_r, KK_zz_r], axis=0)
             KK_ij_r = KK_ij_r - jnp.mean(KK_ij_r, axis=(1, 2, 3), keepdims=True)
-            G_ij_r = KK_ij_r - (1./3.)*dK_ij_r
-            G_ij_k = self._rfftn_vec(G_ij_r)  # (6, ng_L, ng_L, ng_L//2+1)
-            G_ij_k = G_ij_k.at[:,0,0,0].set(0.0).astype(self.complex_dtype)
+            H_ij_r = KK_ij_r - (1./3.)*dK_ij_r
+            H_ij_k = self._rfftn_vec(H_ij_r)  # (6, ng_L, ng_L, ng_L//2+1)
+            H_ij_k = H_ij_k.at[:,0,0,0].set(0.0).astype(self.complex_dtype)
 
             T_r = (delta_r*delta_r - 1.5 * K2_r).astype(self.real_dtype)
             T_ij_k = coord.apply_Gij_k(self.rfftn(T_r), self.kx, self.ky, self.kz)  # (6, ng_L, ng_L, ng_L//2+1)
             T_ij_k = coord.apply_traceless(T_ij_k)
             T_ij_k = T_ij_k.at[:,0,0,0].set(0.0).astype(self.complex_dtype)
 
-            fields.extend([dK_ij_k, G_ij_k, T_ij_k])
+            fields.extend([dK_ij_k, H_ij_k, T_ij_k])
 
         return jnp.array(fields)
     
@@ -1349,16 +1440,14 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
             Sd_r = jnp.zeros((ngL, ngL, ngL), dtype=self.real_dtype)
             St_r = jnp.zeros_like(Sd_r)
 
-            half_n = n // 2
-            for m in range(1, half_n + 1):
+            for m in range(1, n):
                 nm = n - m
                 Sd_mn, St_mn = self._spt_pair_contrib_bandlimited(
                     delk[m - 1], thek[m - 1],
                     delk[nm - 1], thek[nm - 1],
                 )
-                factor = 2.0 if (m < nm) else 1.0
-                Sd_r = Sd_r + factor * Sd_mn
-                St_r = St_r + factor * St_mn
+                Sd_r = Sd_r + Sd_mn
+                St_r = St_r + St_mn
 
             # Closed-form coefficients (Einstein-de Sitter).
             coef = 2.0 / ((2 * n + 3) * (n - 1))
@@ -1423,15 +1512,17 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
         Gn = coord.apply_Gij_k(the_k_nm, self.kx, self.ky, self.kz)  # (6, k)
 
         # Diagonal components (0,3,5)
-        du_m_diag_r  = self._irfftn_vec(-Gm[[0, 3, 5]]).astype(self.real_dtype)
-        du_nm_diag_r = self._irfftn_vec(-Gn[[0, 3, 5]]).astype(self.real_dtype)
+        idx_diag = jnp.array([0, 3, 5], dtype=jnp.int32)
+        idx_off  = jnp.array([1, 2, 4], dtype=jnp.int32)
+        du_m_diag_r  = self._irfftn_vec(jnp.take(Gm, idx_diag, axis=0)).astype(self.real_dtype)
+        du_nm_diag_r = self._irfftn_vec(jnp.take(Gn, idx_diag, axis=0)).astype(self.real_dtype)
         trace_diag = (du_m_diag_r[0] * du_nm_diag_r[0] +
                       du_m_diag_r[1] * du_nm_diag_r[1] +
                       du_m_diag_r[2] * du_nm_diag_r[2])
 
         # Off-diagonal components (1,2,4) with factor 2
-        du_m_off_r  = self._irfftn_vec(-Gm[[1, 2, 4]]).astype(self.real_dtype)
-        du_nm_off_r = self._irfftn_vec(-Gn[[1, 2, 4]]).astype(self.real_dtype)
+        du_m_off_r  = self._irfftn_vec(jnp.take(Gm, idx_off, axis=0)).astype(self.real_dtype)
+        du_nm_off_r = self._irfftn_vec(jnp.take(Gn, idx_off, axis=0)).astype(self.real_dtype)
         trace_off = 2.0 * (du_m_off_r[0] * du_nm_off_r[0] +
                            du_m_off_r[1] * du_nm_off_r[1] +
                            du_m_off_r[2] * du_nm_off_r[2])
@@ -1439,6 +1530,6 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
         S_theta = trace_diag + trace_off + jnp.einsum('iabc,iabc->abc', u_m_r, grad_t_nm_r)
 
         # Remove means for numerical hygiene.
-        S_delta = (S_delta - jnp.mean(S_delta)).astype(self.real_dtype)
-        S_theta = (S_theta - jnp.mean(S_theta)).astype(self.real_dtype)
+        #S_delta = (S_delta - jnp.mean(S_delta)).astype(self.real_dtype)
+        #S_theta = (S_theta - jnp.mean(S_theta)).astype(self.real_dtype)
         return S_delta, S_theta
