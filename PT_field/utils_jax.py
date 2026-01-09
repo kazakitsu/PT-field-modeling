@@ -65,10 +65,55 @@ def growth_D_f(z, omega_m0, *, n_steps=2048, a_min=1e-4):
 
     return D_vals.reshape(jnp.shape(z)), f_vals.reshape(jnp.shape(z))
 
+@partial(jit, static_argnames=("n_steps",))
+def chi_of_z(z, omega_m0, *, n_steps: int = 2048):
+    r"""
+    Comoving radial distance χ(z) for flat ΛCDM (radiation neglected).
+
+    χ(z) = (c/H0) \int_0^z dz' / E(z')
+         = (c/H0) \int_a^1 da' / (a'^2 E(a')),  with a = 1 / (1 + z).
+
+    Parameters
+    ----------
+    z : array_like
+        Redshift(s).
+    omega_m0 : float
+        Omega_{m,0}.
+    n_steps : int, optional
+        Number of integration steps in scale factor a.
+        The integral is performed from a = 1 / (1 + z) to a = 1.
+
+    Returns
+    -------
+    chi : jnp.ndarray
+        Comoving distance χ(z) in [Mpc/h], with the same shape as z.
+    """
+    # Flatten input to 1D and restore shape at the end
+    z_arr = jnp.atleast_1d(z)
+    a_arr = 1.0 / (1.0 + z_arr)  # scale factor at each z
+
+    # χ(a) (dimensionless part): I(a) = ∫_a^1 da' / (a'^2 E(a'))
+    def _chi_of_a(a):
+        a_grid = jnp.linspace(a, 1.0, n_steps)
+        integrand = 1.0 / (a_grid**2 * _E(a_grid, omega_m0))
+        I = jnp.trapezoid(integrand, a_grid)
+        return I
+
+    # Vectorize over all a values
+    I_vals = vmap(_chi_of_a)(a_arr)
+
+    # c / H0 in Mpc/h, for H0 = 100 h km/s/Mpc
+    c_over_H0 = 2997.92458  # [Mpc/h]
+    chi_vals = c_over_H0 * I_vals
+
+    # Restore the original shape of z
+    return chi_vals.reshape(jnp.shape(z))
+
 # -------------------- Orthogonalize & interpolation utilities --------------------
 
 @partial(jit, static_argnames=('measure_pk','Nmin','jitter','dtype',
-                               'warn_on_low_stat', 'warn_max_print'))
+                               'warn_on_low_stat', 'warn_max_print',
+                               'return_Mcoef', 'return_nearest_idx'))
 def orthogonalize(
     fields: jnp.ndarray,            # (n, ng, ng, ng//2+1)
     measure_pk,                     # Measure_Pk instance (self is static)
@@ -78,6 +123,8 @@ def orthogonalize(
     Nmin: int = 5,
     jitter: float = 1e-14,
     dtype=jnp.float32,
+    return_Mcoef: bool = False,
+    return_nearest_idx: bool = False,
     *,
     warn_on_low_stat: bool = True,
     warn_max_print: int = 32,
@@ -224,6 +271,11 @@ def orthogonalize(
     # ---- 3) Nearest expand & sequential update ----
     nearest_idx, _, _ = _build_nearest_idx_for_grid(ng, boxsize, k_edges, mu_edges, dtype=dtype)
 
+    if return_Mcoef:
+        if return_nearest_idx:
+            return Mcoef, nearest_idx
+        return Mcoef
+
     def _expand_nearest(table_NkNmu):
         # table_NkNmu: (Nk, Nmu) -> grid via nearest_idx
         flat = table_NkNmu.reshape(Nk * Nmu)
@@ -239,6 +291,54 @@ def orthogonalize(
         ortho[j] = f
 
     return jnp.array(ortho)
+
+@partial(jit, static_argnames=("apply_beta",))
+def apply_Mcoef(
+    fields_k: jnp.ndarray,          # (n, ng, ng, ng//2+1)
+    Mcoef: jnp.ndarray,             # (Nk, Nmu, n, n)
+    nearest_idx: jnp.ndarray,       # (ng, ng, ng//2+1) int32/int64
+    *,
+    beta_table: jnp.ndarray | None = None,  # (n, Nk, Nmu) for this z-slice
+    apply_beta: bool = True,
+) -> jnp.ndarray:
+    """
+    Apply (k,mu)-dependent mixing Mcoef to Fourier-space fields.
+
+    Convention (matching your orthogonalize):
+      out[0] = fields[0]
+      out[j] = fields[j] + sum_{i<j} Mgrid(j,i) * fields[i]
+
+    If beta_table is given, also multiply each output field j by beta_j(k,mu) for this slice:
+      out[j] <- beta_j_grid * out[j]
+
+    Notes:
+      - nearest_idx maps flattened (k_bin, mu_bin) -> FFT grid points.
+      - This function does NOT recompute nearest_idx or Mcoef.
+    """
+    n_fields = fields_k.shape[0]
+    Nk = Mcoef.shape[0]
+    Nmu = Mcoef.shape[1]
+
+    def _expand_table_to_grid(table_NkNmu: jnp.ndarray) -> jnp.ndarray:
+        # table_NkNmu: (Nk, Nmu) -> grid (ng, ng, ng//2+1) via nearest_idx
+        flat = table_NkNmu.reshape(Nk * Nmu)
+        return jnp.take(flat, nearest_idx, axis=0)
+
+    outs = []
+    for j in range(n_fields):
+        f = fields_k[j]
+        # Sequential mixing using ORIGINAL (not yet mixed) fields_k[i].
+        for i in range(j):
+            Mgrid = _expand_table_to_grid(Mcoef[:, :, j, i])
+            f = f + Mgrid * fields_k[i]
+
+        if apply_beta and (beta_table is not None):
+            beta_grid = _expand_table_to_grid(beta_table[j])
+            f = f * beta_grid
+
+        outs.append(f)
+
+    return jnp.stack(outs, axis=0)
 
 def _build_nearest_idx_for_grid(ng: int,
                                 boxsize: float,

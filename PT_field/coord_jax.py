@@ -60,7 +60,7 @@ def apply_Gij_k(delta_k, kx, ky, kz):
     return jnp.stack([g_xx, g_xy, g_xz, g_yy, g_yz, g_zz], axis=0)
 
 @jit
-def apply_nabla_k(delta_k, kx, ky, kz):
+def apply_grad_k(delta_k, kx, ky, kz):
     """(3, ...): gradient in k-space, 1j * k_i * delta_k (no 1/k^2)."""
     ctype = delta_k.dtype
 

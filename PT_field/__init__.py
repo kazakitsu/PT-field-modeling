@@ -1,6 +1,6 @@
 # utils/__init__.py
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 try:
     import jax.numpy
@@ -14,7 +14,7 @@ if use_jax:
         mu2_grid,
         apply_disp_k,
         apply_Gij_k,
-        apply_nabla_k,
+        apply_grad_k,
         apply_gauss_k,
         apply_traceless,
         func_extend,
@@ -24,14 +24,14 @@ if use_jax:
         high_pass_filter_fourier,
     )
     from .forward_model_jax import Base_Forward, LPT_Forward, EPT_Forward
-    from .utils_jax import growth_D_f, orthogonalize, beta_polyfit, compute_corr_2d, check_max_rij, compute_pks_2d
+    from .utils_jax import growth_D_f, chi_of_z, orthogonalize, beta_polyfit, compute_corr_2d, check_max_rij, compute_pks_2d
 else:  ### to be implemented
     from .coord import (
         kaxes_1d,
         mu2_grid,
         apply_disp_k,
         apply_Gij_k,
-        apply_nabla_k,
+        apply_grad_k,
         apply_gauss_k,
         apply_traceless,
         func_extend,
@@ -49,7 +49,7 @@ __all__ = [
     "mu2_grid",
     "apply_disp_k",
     "apply_Gij_k",
-    "apply_nabla_k",
+    "apply_grad_k",
     "apply_gauss_k",
     "apply_traceless",
     "func_extend",

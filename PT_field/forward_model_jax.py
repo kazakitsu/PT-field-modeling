@@ -8,6 +8,7 @@ from jax import jit, vmap, lax
 from functools import partial
 
 import PT_field.coord_jax as coord
+import PT_field.utils_jax as utils_jax
 import lss_utils.assign_util_jax as assign_util
 
 # ------------------------------ Base class ------------------------------
@@ -20,13 +21,15 @@ class Base_Forward:
     """
 
     def __init__(self, *, boxsize: float,
-                 ng: Optional[int] = None,  # make ng optional
-                 ng_L: int,
+                 ng: int,
+                 ng_pad: Optional[int] = None, 
+                 ng_L: Optional[int] = None,
                  dtype=jnp.float32,
                  use_batched_fft: bool = True):
         self.boxsize: float = float(boxsize)
-        self.ng:      Optional[int] = int(ng) if ng is not None else None
-        self.ng_L:      int = int(ng_L)
+        self.ng:      int = int(ng)
+        self.ng_pad:  int = int(ng_pad) if ng_pad is not None else self._get_ng_pad(self.ng)
+        self.ng_L:    Optional[int] = int(ng_L) if ng_L is not None else int(ng)
         self.real_dtype = jnp.dtype(dtype)
         self.complex_dtype = jnp.complex64 if self.real_dtype == jnp.float32 else jnp.complex128
         self.use_batched_fft = bool(use_batched_fft)
@@ -43,7 +46,8 @@ class Base_Forward:
         self.b_rfftn  = jit(vmap(partial(jnp.fft.rfftn,  norm='forward'), in_axes=0, out_axes=0))
 
         # Keep only 1D k-axes to avoid captured 3D constants
-        self.kx,  self.ky,  self.kz  = coord.kaxes_1d(self.ng_L, self.boxsize, dtype=self.real_dtype)
+        self.kx,  self.ky,  self.kz  = coord.kaxes_1d(self.ng, self.boxsize, dtype=self.real_dtype)
+        #self.kx_L,  self.ky_L,  self.kz_L  = coord.kaxes_1d(self.ng_L, self.boxsize, dtype=self.real_dtype)
 
     # -------- FFT helpers (normalized) -------------------------------
     def irfftn(self, array_k: jnp.ndarray) -> jnp.ndarray:
@@ -84,6 +88,111 @@ class Base_Forward:
                 outs.append(self.rfftn(array_r[i]))
             return jnp.stack(outs, axis=0)
         
+    def _get_ng_pad(self, ng:int, pad_factor:float=1.5) -> int:
+        """Return working grid size for dealiased products."""
+        ng_pad = int(jnp.ceil(ng * pad_factor))
+        if ng_pad % 2 == 1:
+            ng_pad += 1
+        return ng_pad
+    
+    @partial(jit, static_argnames=('self',))
+    def pad_fields(
+            self,
+            fields_k: jnp.ndarray,   # (n_fields, ng, ng, ng//2+1)
+        ) -> jnp.ndarray:
+        """Zero-pad a batch of rfftn-layout fields along axis=0"""
+        fields_k = jnp.asarray(fields_k, dtype=self.complex_dtype)
+        num_fields, ng, _, _ = fields_k.shape
+
+        if ng == self.ng_pad:
+            return fields_k
+        
+        out = jnp.zeros((num_fields, self.ng_pad, self.ng_pad, self.ng_pad//2+1), dtype=self.complex_dtype)
+
+        def body(i, acc):
+            slab = fields_k[i]
+            padded = coord.func_extend(self.ng_pad, slab)
+            return acc.at[i].set(padded)
+        
+        return lax.fori_loop(0, num_fields, body, out)
+    
+    @partial(jit, static_argnames=('self',))
+    def unpad_fields(
+            self,
+            fields_k: jnp.ndarray,   # (n_fields, ng, ng, ng//2+1)
+        ) -> jnp.ndarray:
+        """unpad a batch of rfftn-layout fields along axis=0"""
+        fields_k = jnp.asarray(fields_k, dtype=self.complex_dtype)
+        num_fields, ng, _, _ = fields_k.shape
+
+        if ng == self.ng:
+            return fields_k
+        
+        out = jnp.zeros((num_fields, self.ng, self.ng, self.ng//2+1), dtype=self.complex_dtype)
+
+        def body(i, acc):
+            slab = fields_k[i]
+            padded = coord.func_reduce_hermite(self.ng, slab)
+            return acc.at[i].set(padded)
+        
+        return lax.fori_loop(0, num_fields, body, out)
+    
+    @partial(jit, static_argnames=("self",))
+    def _safe_square(
+        self,
+        f_k: jnp.ndarray,  # (ng, ng, ng//2+1)
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Compute f^2 with de-aliasing and return:
+          - f2_r  : real-space field on the physical grid (ng^3)
+          - f2_k : k-space field on the physical grid (ng^3)
+        """
+        f_k = f_k.astype(self.complex_dtype)
+
+        # pad to ng_pad, go to real, square
+        f_k_pad = self.pad_fields(f_k[None, ...])[0]
+        f_r_pad = self.irfftn(f_k_pad)
+        f2_r_pad = f_r_pad * f_r_pad
+
+        # back to k, low-pass to ng
+        f2_k_pad = self.rfftn(f2_r_pad)
+        f2_k = self.unpad_fields(f2_k_pad[None, ...])[0]
+        f2_r = self.irfftn(f2_k)
+
+        return f2_r, f2_k
+    
+    @partial(jit, static_argnames=("self",))
+    def _safe_product(
+        self,
+        f1_k: jnp.ndarray,  # (ng, ng, ng//2+1)
+        f2_k: jnp.ndarray,  # (ng, ng, ng//2+1)
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Compute f1 * f2 with de-aliasing and return:
+          - f1_f2_r    : real-space field on the physical grid (ng^3)
+          - f1_f2_k: k-space field on the physical grid (ng^3)
+        """
+        f1_k = f1_k.astype(self.complex_dtype)
+        f2_k = f2_k.astype(self.complex_dtype)
+
+        # pad both to ng_pad
+        f_k_arr = jnp.stack([
+            f1_k,
+            f2_k,
+        ], axis=0)  # (2, ng, ng, ng//2+1)
+        f_k_arr_pad = self.pad_fields(f_k_arr)
+        f_r_arr_pad = self._irfftn_vec(f_k_arr_pad)  # (2, ng_pad, ng_pad, ng_pad)
+        f1_r_pad, f2_r_pad = f_r_arr_pad[0], f_r_arr_pad[1]
+
+        f1_f2_r_pad = f1_r_pad * f2_r_pad
+
+        # back to k, low-pass to ng
+        f1_f2_k_pad = self.rfftn(f1_f2_r_pad)
+        f1_f2_k = self.unpad_fields(f1_f2_k_pad[None, ...])[0]
+        f1_f2_r = self.irfftn(f1_f2_k)
+
+        return f1_f2_r, f1_f2_k
+    
     # ---------------- public knobs ----------------
     def set_ng(self, ng: int) -> None:
         r"""Set ng after construction, and invalidate grid caches."""
@@ -95,7 +204,7 @@ class Base_Forward:
 
     def _invalidate_small_k_caches(self) -> None:
         r"""Drop grid axes and k^2 caches; safe to call anytime."""
-        for name in ("kx_", "ky_", "kz_", "_kxy2_", "_kz2_"):
+        for name in ("kx", "ky", "kz", "_kxy2", "_kz2"):
             if hasattr(self, name):
                 delattr(self, name)
         
@@ -111,18 +220,18 @@ class Base_Forward:
         r"""Build 1D-grid (kx_, ky_, kz_) once; safe to call multiple times."""
         self._require_ng("_ensure_kaxes_small")
         if not hasattr(self, "kx_"):
-            kx_, ky_, kz_ = coord.kaxes_1d(self.ng, self.boxsize, dtype=self.real_dtype)
-            self.kx_, self.ky_, self.kz_ = kx_, ky_, kz_
+            kx, ky, kz = coord.kaxes_1d(self.ng, self.boxsize, dtype=self.real_dtype)
+            self.kx, self.ky, self.kz = kx, ky, kz
 
     def _ensure_k_caches(self) -> None:
         r"""Build grid k^2 caches once; safe to call many times."""
         self._ensure_kaxes()
-        if not hasattr(self, "_kxy2_"):
-            kx2 = (self.kx_ ** 2).astype(self.real_dtype)
-            ky2 = (self.ky_ ** 2).astype(self.real_dtype)
-            kz2 = (self.kz_ ** 2).astype(self.real_dtype)
-            self._kxy2_ = (kx2[:, None] + ky2[None, :]).astype(self.real_dtype)  # (ng, ng)
-            self._kz2_  = kz2  # (ng//2+1,)
+        if not hasattr(self, "_kxy2"):
+            kx2 = (self.kx ** 2).astype(self.real_dtype)
+            ky2 = (self.ky ** 2).astype(self.real_dtype)
+            kz2 = (self.kz ** 2).astype(self.real_dtype)
+            self._kxy2 = (kx2[:, None] + ky2[None, :]).astype(self.real_dtype)  # (ng, ng)
+            self._kz2  = kz2  # (ng//2+1,)
 
     # ---------------- linear modes (public wrapper) ----------------
     def linear_modes(self, pk_lin: jnp.ndarray, gauss_3d: jnp.ndarray) -> jnp.ndarray:
@@ -156,9 +265,9 @@ class Base_Forward:
 
         if use_fused:
             # ---- fused 3D path ----
-            kx2 = (self.kx_ ** 2).astype(self.real_dtype)[:, None, None]
-            ky2 = (self.ky_ ** 2).astype(self.real_dtype)[None, :, None]
-            kz2 = (self.kz_ ** 2).astype(self.real_dtype)[None, None, :]
+            kx2 = (self.kx ** 2).astype(self.real_dtype)[:, None, None]
+            ky2 = (self.ky ** 2).astype(self.real_dtype)[None, :, None]
+            kz2 = (self.kz ** 2).astype(self.real_dtype)[None, None, :]
 
             kmag = jnp.sqrt(kx2 + ky2 + kz2).astype(self.real_dtype)
             Pk   = jnp.interp(kmag, k_tab, P_tab, left=0.0, right=0.0)
@@ -171,23 +280,23 @@ class Base_Forward:
             out = jnp.zeros_like(gauss_3d, dtype=self.complex_dtype)
 
             def body(iz, acc):
-                kmag_2d = jnp.sqrt(self._kxy2_ + self._kz2_[iz]).astype(self.real_dtype)
+                kmag_2d = jnp.sqrt(self._kxy2 + self._kz2[iz]).astype(self.real_dtype)
                 P_2d    = jnp.interp(kmag_2d, k_tab, P_tab, left=0.0, right=0.0)
-                P_2d    = jnp.where((self._kz2_[iz] == 0.0) & (self._kxy2_ == 0.0), 0.0, P_2d)
+                P_2d    = jnp.where((self._kz2[iz] == 0.0) & (self._kxy2 == 0.0), 0.0, P_2d)
                 amp_2d  = jnp.sqrt(P_2d * inv2V).astype(self.real_dtype)
                 slab    = (amp_2d * gauss_3d[:, :, iz]).astype(self.complex_dtype)
                 return acc.at[:, :, iz].set(slab)
 
-            out = lax.fori_loop(0, self.kz_.shape[0], body, out)
+            out = lax.fori_loop(0, self.kz.shape[0], body, out)
             return out
-
+        
 
 class Beta_Combine_Mixin:
     r"""
     Shared helpers to combine basis fields in k-space and compute beta.
     Requires the subclass to define:
       - self.ng_E
-      - self.kx2E, self.ky2E, self.kz2E
+      - self.kx2_E, self.ky2_E, self.kz2_E
     """
 
     def _kmu_from_cache_or_build(self):
@@ -195,13 +304,13 @@ class Beta_Combine_Mixin:
         Returns:
           k2, mu2, mu4, kmag, mu (shape = (ng_E, ng_E, ng_E//2+1))
         """
-        if hasattr(self, "_k2E_grid"):
+        if hasattr(self, "_k2_E_grid"):
             k2  = self._k2E_grid
             mu2 = self._mu2E_grid
             mu4 = self._mu4E_grid
         else:
-            k2  = (self.kx2E[:, None, None] + self.ky2E[None, :, None] + self.kz2E[None, None, :]).astype(self.real_dtype)
-            mu2 = jnp.where(k2 > 0, self.kz2E[None, None, :] / k2, 0.0).astype(self.real_dtype)
+            k2  = (self.kx2_E[:, None, None] + self.ky2_E[None, :, None] + self.kz2_E[None, None, :]).astype(self.real_dtype)
+            mu2 = jnp.where(k2 > 0, self.kz2_E[None, None, :] / k2, 0.0).astype(self.real_dtype)
             mu4 = (mu2 * mu2).astype(self.real_dtype)
 
         kmag = jnp.sqrt(jnp.maximum(k2, 0.0)).astype(self.real_dtype)
@@ -275,7 +384,7 @@ class Beta_Combine_Mixin:
             return
 
         # Construct k^2 on the rfft grid to avoid a costly sqrt for k-binning.
-        k2 = (self.kx2E[:, None, None] + self.ky2E[None, :, None] + self.kz2E[None, None, :])
+        k2 = (self.kx2_E[:, None, None] + self.ky2_E[None, :, None] + self.kz2_E[None, None, :])
 
         # Bin by k using k^2; edges are squared once (monotone -> binning is preserved).
         k_edges2 = (k_edges * k_edges).astype(self.real_dtype)
@@ -283,7 +392,7 @@ class Beta_Combine_Mixin:
         kbin = jnp.clip(jnp.searchsorted(k_edges2, k2, side="right") - 1, 0, Nk - 1)
 
         # Bin by mu using mu^2 to avoid sqrt; again edges are squared once.
-        mu2 = jnp.where(k2 > 0, self.kz2E[None, None, :] / k2, 0.0).astype(self.real_dtype)
+        mu2 = jnp.where(k2 > 0, self.kz2_E[None, None, :] / k2, 0.0).astype(self.real_dtype)
         mu_edges2 = (mu_edges * mu_edges).astype(self.real_dtype)
         Nmu = int(mu_edges.shape[0] - 1)
         mubin = jnp.clip(jnp.searchsorted(mu_edges2, mu2, side="right") - 1, 0, Nmu - 1)
@@ -586,7 +695,6 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
     r"""
     Compute shifted fields using LPT displacement.
     
-    
     Assignment strategy:
       - assign_mode="auto" (default):
           use `vmap` if (ng_E <= vmap_ng_threshold and n_fields <= vmap_fields_threshold)
@@ -597,12 +705,12 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
     FFT+deconvolution:
       - Always uses `Mesh_Assignment.fft_deconvolve_batched` to batch FFT across fields.
     """
-
     def __init__(
         self,
         *,
         boxsize: float,
-        ng: Optional[int] = None,
+        ng: int,
+        ng_pad: Optional[int] = None,
         ng_L: int,
         ng_E: int,
         mas_cfg: Tuple[int, bool],
@@ -619,7 +727,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
         vmap_ng_threshold: int = 256,
         vmap_fields_threshold: int = 4,
     ) -> None:
-        super().__init__(boxsize=boxsize, ng=ng, ng_L=ng_L, dtype=dtype, use_batched_fft=use_batched_fft)
+        super().__init__(boxsize=boxsize, ng=ng, ng_pad=ng_pad, ng_L=ng_L, dtype=dtype, use_batched_fft=use_batched_fft)
 
         # Eulerian grid & MAS
         self.ng_E = int(ng_E)
@@ -645,108 +753,331 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
         # Do not store 3D base positions; build on-the-fly
         self.cell_size = self.boxsize / self.ng_L
 
-        self.kxE, self.kyE, self.kzE = coord.kaxes_1d(self.ng_E, self.boxsize, dtype=self.real_dtype)
-        self.kx2E = self.kxE * self.kxE
-        self.ky2E = self.kyE * self.kyE
-        self.kz2E = self.kzE * self.kzE
+        self.kx_L, self.ky_L, self.kz_L = coord.kaxes_1d(self.ng_L, self.boxsize, dtype=self.real_dtype)
+        self.kx_pad, self.ky_pad, self.kz_pad = coord.kaxes_1d(self.ng_pad, self.boxsize, dtype=self.real_dtype)
+
+        self.kx_E, self.ky_E, self.kz_E = coord.kaxes_1d(self.ng_E, self.boxsize, dtype=self.real_dtype)
+        self.kx2_E = self.kx_E * self.kx_E
+        self.ky2_E = self.ky_E * self.ky_E
+        self.kz2_E = self.kz_E * self.kz_E
 
         # Small cache for 'nearest' interpolation map
         self._nearest_idx = None       # int32 indices of shape (ng_E, ng_E, ng_E//2+1)
         self._k_edges_cache = None     # last-used k_edges
         self._mu_edges_cache = None    # last-used mu_edges
 
+    @partial(jit, static_argnames=('self',))
+    def pad_fields_L(
+            self,
+            fields_k: jnp.ndarray,   # (n_fields, ng, ng, ng//2+1)
+        ) -> jnp.ndarray:
+        """Zero-pad a batch of rfftn-layout fields along axis=0"""
+        fields_k = jnp.asarray(fields_k, dtype=self.complex_dtype)
+        num_fields, ng, _, _ = fields_k.shape
+
+        if ng == self.ng_L:
+            return fields_k
+        
+        out = jnp.zeros((num_fields, self.ng_L, self.ng_L, self.ng_L//2+1), dtype=self.complex_dtype)
+
+        def body(i, acc):
+            slab = fields_k[i]
+            padded = coord.func_extend(self.ng_L, slab)
+            return acc.at[i].set(padded)
+        
+        return lax.fori_loop(0, num_fields, body, out)
+    
+    @partial(jit, static_argnames=('self',))
+    def unpad_fields_L(
+            self,
+            fields_k: jnp.ndarray,   # (n_fields, ng, ng, ng//2+1)
+        ) -> jnp.ndarray:
+        """unpad a batch of rfftn-layout fields along axis=0"""
+        fields_k = jnp.asarray(fields_k, dtype=self.complex_dtype)
+        num_fields, ng, _, _ = fields_k.shape
+
+        if ng == self.ng_L:
+            return fields_k
+        
+        out = jnp.zeros((num_fields, self.ng_L, self.ng_L, self.ng_L//2+1), dtype=self.complex_dtype)
+
+        def body(i, acc):
+            slab = fields_k[i]
+            padded = coord.func_reduce_hermite(self.ng_L, slab)
+            return acc.at[i].set(padded)
+        
+        return lax.fori_loop(0, num_fields, body, out)
+
+    @partial(jit, static_argnames=("self",))
+    def _safe_square_L(
+        self,
+        f_k: jnp.ndarray,  # (ng, ng, ng//2+1)
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Compute f^2 with de-aliasing and return:
+          - f2_r_L  : real-space field on the Lagrangian grid (ng_L^3)
+          - f2_k : k-space field on the physical grid (ng^3)
+        """
+        f_k = f_k.astype(self.complex_dtype)
+
+        # pad to ng_pad, go to real, square
+        f_k_pad = self.pad_fields(f_k[None, ...])[0]
+        f_r_pad = self.irfftn(f_k_pad)
+        f2_r_pad = f_r_pad * f_r_pad
+
+        # back to k, low-pass to ng
+        f2_k_pad = self.rfftn(f2_r_pad)
+        f2_k = self.unpad_fields(f2_k_pad[None, ...])[0]
+
+        # extend to ng_L and go back to real
+        f2_k_L = self.pad_fields_L(f2_k[None, ...])[0]
+        f2_r_L = self.irfftn(f2_k_L)
+
+        return f2_r_L, f2_k
+    
+    @partial(jit, static_argnames=("self",))
+    def _safe_product_L(
+        self,
+        f1_k: jnp.ndarray,  # (ng, ng, ng//2+1)
+        f2_k: jnp.ndarray,  # (ng, ng, ng//2+1)
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Compute f1 * f2 with de-aliasing and return:
+          - f1_f2_r_L    : real-space field on the Lagrangian grid (ng_L^3)
+          - f1_f2_k: k-space field on the physical grid (ng^3)
+        """
+        f1_k = f1_k.astype(self.complex_dtype)
+        f2_k = f2_k.astype(self.complex_dtype)
+
+        # pad both to ng_pad
+        f_k_arr = jnp.stack([
+            f1_k,
+            f2_k,
+        ], axis=0)  # (2, ng, ng, ng//2+1)
+        f_k_arr_pad = self.pad_fields(f_k_arr)
+        f_r_arr_pad = self._irfftn_vec(f_k_arr_pad)  # (2, ng_pad, ng_pad, ng_pad)
+        f1_r_pad, f2_r_pad = f_r_arr_pad[0], f_r_arr_pad[1]
+
+        f1_f2_r_pad = f1_r_pad * f2_r_pad
+
+        # back to k, low-pass to ng
+        f1_f2_k_pad = self.rfftn(f1_f2_r_pad)
+        f1_f2_k = self.unpad_fields(f1_f2_k_pad[None, ...])[0]
+
+        # extend to ng_L and go back to real
+        f1_f2_k_L = self.pad_fields_L(f1_f2_k[None, ...])[0]
+        f1_f2_r_L = self.irfftn(f1_f2_k_L)
+
+        return f1_f2_r_L, f1_f2_k
+    
+    def _to_r_L_from_k(self, field_k: jnp.ndarray) -> jnp.ndarray:
+        r"""
+        Map a k-space field on the ng grid to r-space on the ng_L grid with padding.
+        """
+        if field_k.ndim == 3:
+            field_k_pad = self.pad_fields(field_k[None,...])[0]
+            field_k_L = self.pad_fields_L(field_k_pad[None,...])[0]
+            field_r_L = self.irfftn(field_k_L)
+        else:
+            field_k_pad = self.pad_fields(field_k)
+            field_k_L = self.pad_fields_L(field_k_pad)
+            field_r_L = self._irfftn_vec(field_k_L)
+        return field_r_L
+            
     # -------------------- LPT displacement --------------------
     @partial(jit, static_argnames=('self',))
-    def lpt(self, delta_k_L: jnp.ndarray, growth_f: float = 0.0) -> jnp.ndarray:
-        delta_k_L = delta_k_L.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
-        disp_k = coord.apply_disp_k(delta_k_L, self.kx, self.ky, self.kz).astype(self.complex_dtype)
-        disp_r = self._irfftn_vec(disp_k).astype(self.real_dtype)
+    def lpt(self, delta_k: jnp.ndarray, growth_f: float = 0.0) -> jnp.ndarray:
+        delta_k = delta_k.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
+        disp_k = coord.apply_disp_k(delta_k, self.kx, self.ky, self.kz).astype(self.complex_dtype)
+        disp_k_L = self.pad_fields_L(disp_k)
+        disp_r_L = self._irfftn_vec(disp_k_L).astype(self.real_dtype)
         if self.rsd:
             gf = jnp.asarray(growth_f, dtype=self.real_dtype)
-            disp_r = disp_r.at[2].add(disp_r[2] * gf)
-        return disp_r  # (3, ng, ng, ng)
+            disp_r_L = disp_r_L.at[2].add(disp_r_L[2] * gf)
+        return disp_r_L  # (3, ng, ng, ng)
 
     # -------- scalar fields in position space -------
-    @partial(jit, static_argnames=('self',))
-    def _scalar_fields_r(self, delta_k: jnp.ndarray) -> jnp.ndarray:
+    @partial(jit, static_argnames=('self', 'full_fields'))
+    def _scalar_fields_r(self, delta_k: jnp.ndarray, full_fields=False) -> jnp.ndarray:
         r"""
         Build scalar fields in position space: [1, delta, d^2, G2, (G2_zz), (LyA extras...)]
         Returns stacked array with leading field axis.
         """
         delta_k = delta_k.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
-        fields = [jnp.ones((delta_k.shape[0],) * 3, dtype=self.real_dtype)]
+        delta_k_pad = coord.func_extend(self.ng_pad, delta_k)
+        fields = [jnp.ones((self.ng_L,) * 3, dtype=self.real_dtype)]
 
         if self.bias_order >= 1:
-            delta_r = self.irfftn(delta_k)
-            fields.append(delta_r)
+            delta_k_L = self.pad_fields_L(delta_k[None,...])[0]
+            delta_r_L = self.irfftn(delta_k_L)
+            fields.append(delta_r_L)
 
         if self.bias_order >= 2:
-            d2_r = delta_r**2
-            sigma2 = jnp.mean(delta_r**2)
-            d2_r = d2_r - sigma2
+            delta_r_pad = self.irfftn(delta_k_pad)
+            d2_r_pad = delta_r_pad**2
+            d2_k_pad = self.rfftn(d2_r_pad)
+            d2_k     = self.unpad_fields(d2_k_pad[None,...])[0]
+            d2_k_L   = self.pad_fields_L(d2_k[None,...])[0]
+            d2_r_L   = self.irfftn(d2_k_L)
+            sigma2_L = jnp.mean(d2_r_L)
+            d2_r_L = d2_r_L - jnp.mean(d2_r_L)
 
             Gij_k = coord.apply_Gij_k(delta_k, self.kx, self.ky, self.kz)  # (6, ...)
-            Gij_r = self._irfftn_vec(Gij_k)  # real
+            Gij_k_pad = self.pad_fields(Gij_k)  # (6, ...)
+            Gij_r_pad = self._irfftn_vec(Gij_k_pad)  # real
             # 0: xx, 1: xy, 2: xz, 3: yy, 4: yz, 5: zz
 
-            phi2 = (Gij_r[0] * Gij_r[3] + Gij_r[3] * Gij_r[5] + Gij_r[5] * Gij_r[0]
-                    - Gij_r[1]**2 - Gij_r[2]**2 - Gij_r[4]**2)
-            G2_r = -2.0 * phi2
-            G2_r = G2_r - jnp.mean(G2_r)
+            phi2_pad = (Gij_r_pad[0] * Gij_r_pad[3] + Gij_r_pad[3] * Gij_r_pad[5] + Gij_r_pad[5] * Gij_r_pad[0]
+                        - Gij_r_pad[1]**2 - Gij_r_pad[2]**2 - Gij_r_pad[4]**2)
+            G2_r_pad = -2.0 * phi2_pad
+            G2_k_pad = self.rfftn(G2_r_pad)
+            G2_k     = self.unpad_fields(G2_k_pad[None,...])[0]
+            G2_k_L   = self.pad_fields_L(G2_k[None,...])[0]
+            G2_r_L   = self.irfftn(G2_k_L)
+            G2_r_L = G2_r_L - jnp.mean(G2_r_L)
 
-            fields.extend([d2_r, G2_r])
+            fields.extend([d2_r_L, G2_r_L])
 
             # RSD term G2_zz
             if self.rsd or self.lya:
                 mu2 = coord.mu2_grid(self.kx, self.ky, self.kz)
-                G2_zz_r = self.irfftn(self.rfftn(G2_r) * mu2)
-                G2_zz_r = G2_zz_r - jnp.mean(G2_zz_r)
-                fields.append(G2_zz_r)
+                G2_zz_k = mu2 * G2_k
+                G2_zz_k_L = self.pad_fields_L(G2_zz_k[None,...])[0]
+                G2_zz_r_L = self.irfftn(G2_zz_k_L)
+                G2_zz_r_L = G2_zz_r_L - jnp.mean(G2_zz_r_L)
+                fields.append(G2_zz_r_L)
 
             # Ly-A extras
             if self.lya:
-                eta_r = Gij_r[5]  # equals delta * mu^2 in k space (Gzz)
-                eta2_r = eta_r**2 - jnp.mean(eta_r**2)
-                deta_r = delta_r * eta_r - jnp.mean(delta_r * eta_r)
-                GG_zz_r = (Gij_r[2]**2 + Gij_r[4]**2 + Gij_r[5]**2)
-                GG_zz_r = GG_zz_r - jnp.mean(GG_zz_r)
+                if full_fields:
+                    eta_k_L = self.pad_fields_L(Gij_k[5][None,...])[0] # equals delta * mu^2 in k space (Gzz)
+                    eta_r_L = self.irfftn(eta_k_L)
+                    eta_r_L = eta_r_L - jnp.mean(eta_r_L)
 
-                KK_zz_r = GG_zz_r - (2./3.) * deta_r + (1./9.) * d2_r
-                KK_zz_r = KK_zz_r - jnp.mean(KK_zz_r)
+                eta2_r_pad = Gij_r_pad[5]**2
+                eta2_k_pad = self.rfftn(eta2_r_pad)
+                eta2_k = self.unpad_fields(eta2_k_pad[None,...])[0]
+                eta2_k_L = self.pad_fields_L(eta2_k[None,...])[0]
+                eta2_r_L = self.irfftn(eta2_k_L)
+                eta2_r_L = eta2_r_L - jnp.mean(eta2_r_L)
 
-                ### degenerate operators
-                pi_zz_r = GG_zz_r - 5./7 * G2_zz_r
-                #fields.extend([eta2_r, deta_r, KK_zz_r])
-                fields.extend([eta2_r, deta_r, KK_zz_r, 
-                               eta_r, pi_zz_r])
+                deta_r_pad = delta_r_pad * Gij_r_pad[5]
+                deta_k_pad = self.rfftn(deta_r_pad)
+                deta_k     = self.unpad_fields(deta_k_pad[None,...])[0]
+                deta_k_L   = self.pad_fields_L(deta_k[None,...])[0]
+                deta_r_L = self.irfftn(deta_k_L)
+                deta_r_L = deta_r_L - jnp.mean(deta_r_L)
+
+                GG_zz_r_pad = Gij_r_pad[2]**2 + Gij_r_pad[4]**2 + Gij_r_pad[5]**2
+                GG_zz_k_pad = self.rfftn(GG_zz_r_pad)
+                GG_zz_k = self.unpad_fields(GG_zz_k_pad[None,...])[0]
+                GG_zz_k_L = self.pad_fields_L(GG_zz_k[None,...])[0]
+                GG_zz_r_L = self.irfftn(GG_zz_k_L)
+                GG_zz_r_L = GG_zz_r_L - jnp.mean(GG_zz_r_L)
+
+                KK_zz_r_L = GG_zz_r_L - (2./3.) * deta_r_L + (1./9.) * d2_r_L
+                KK_zz_r_L = KK_zz_r_L - jnp.mean(KK_zz_r_L)
+
+                if full_fields:
+                    ### degenerate operators
+                    pi_zz_r_L = GG_zz_r_L - 5./7 * G2_zz_r_L
+                    fields.extend([eta2_r_L, deta_r_L, KK_zz_r_L, 
+                                   eta_r_L, pi_zz_r_L])
+                else:
+                    fields.extend([eta2_r_L, deta_r_L, KK_zz_r_L])
 
         if self.bias_order >= 3:
-            d3_r = delta_r**3
+            #d3_r_L, d3_k   = self._safe_product_L(delta_k, d2_k)
+            d3_r_pad = delta_r_pad**3
+            d3_k_pad = self.rfftn(d3_r_pad)
+            d3_k     = self.unpad_fields(d3_k_pad[None,...])[0]
+            d3_k_L   = self.pad_fields_L(d3_k[None,...])[0]
+            d3_r_L   = self.irfftn(d3_k_L)
+
             # dG2
-            dG2_r = delta_r * G2_r
+            #dG2_r_L, dG2_k = self._safe_product_L(delta_k, G2_k)
+            dG2_r_pad = delta_r_pad * G2_r_pad
+            dG2_k_pad = self.rfftn(dG2_r_pad)
+            dG2_k     = self.unpad_fields(dG2_k_pad[None,...])[0]
+            dG2_k_L   = self.pad_fields_L(dG2_k[None,...])[0]
+            dG2_r_L   = self.irfftn(dG2_k_L)
 
             # G3
+            # 0: xx, 1: xy, 2: xz, 3: yy, 4: yz, 5: zz
             ### - Det(Gij_r)
-            phi3a_r = Gij_r[0]*Gij_r[4]*Gij_r[4] + Gij_r[3]*Gij_r[2]*Gij_r[2] + Gij_r[5]*Gij_r[1]*Gij_r[1] - 2.0*Gij_r[1]*Gij_r[2]*Gij_r[4] - Gij_r[0]*Gij_r[3]*Gij_r[5]
-            G3_r    = 3.0*phi3a_r
+            '''
+            Gxy2_r, Gxy2_k = self._safe_square(Gij_k[1])
+            Gxz2_r, Gxz2_k = self._safe_square(Gij_k[2])
+            Gyz2_r, Gyz2_k = self._safe_square(Gij_k[4])
+
+            GxzGyz_r, GxzGyz_k = self._safe_product(Gij_k[2], Gij_k[4])
+            GyyGzz_r, GyyGzz_k = self._safe_product(Gij_k[3], Gij_k[5])
+
+            GxxGyz2_r_L, GxxGyz2_k = self._safe_product_L(Gij_k[0], Gyz2_k)
+            GyyGxz2_r_L, GyyGxz2_k = self._safe_product_L(Gij_k[3], Gxz2_k)
+            GzzGxy2_r_L, GzzGxy2_k = self._safe_product_L(Gij_k[5], Gxy2_k)
+            GxyGxzGyz_r_L, GxyGxzGyz_k = self._safe_product_L(Gij_k[1], GxzGyz_k)
+            GxxGyyGzz_r_L, GxxGyyGzz_k = self._safe_product_L(Gij_k[0], GyyGzz_k)
+
+            phi3a_r_L = GxxGyz2_r_L + GyyGxz2_r_L + GzzGxy2_r_L - 2.0*GxyGxzGyz_r_L - GxxGyyGzz_r_L
+            G3_r_L    = -3.0*phi3a_r_L
+            '''
+            phi3a_r_pad = Gij_r_pad[0]*Gij_r_pad[4]*Gij_r_pad[4] + Gij_r_pad[3]*Gij_r_pad[2]*Gij_r_pad[2] + Gij_r_pad[5]*Gij_r_pad[1]*Gij_r_pad[1] - 2.0*Gij_r_pad[1]*Gij_r_pad[2]*Gij_r_pad[4] - Gij_r_pad[0]*Gij_r_pad[3]*Gij_r_pad[5]
+            phi3a_k_pad = self.rfftn(phi3a_r_pad)
+            phi3a_k     = self.unpad_fields(phi3a_k_pad[None,...])[0]
+            phi3a_k_L   = self.pad_fields_L(phi3a_k[None,...])[0]
+            phi3a_r_L   = self.irfftn(phi3a_k_L)
+            G3_r_L      = -3.0*phi3a_r_L
 
             # Gamma3
-            G2_k    = self.rfftn(G2_r)
             G2ij_k  = coord.apply_Gij_k(G2_k, self.kx, self.ky, self.kz)  # (6, ...)
-            G2ij_r  = self._irfftn_vec(G2ij_k)
-            phi3b_r = 0.5*Gij_r[0]*(G2ij_r[3]+G2ij_r[5]) + 0.5*Gij_r[3]*(G2ij_r[0]+G2ij_r[5]) + 0.5*Gij_r[5]*(G2ij_r[0]+G2ij_r[3]) - Gij_r[1]*G2ij_r[1] - Gij_r[2]*G2ij_r[2] - Gij_r[4]*G2ij_r[4]
+            G2ij_k_pad = self.pad_fields(G2ij_k)  # (6, ...)
+            '''
+            GxxG2yy_r_L, _ = self._safe_product_L(Gij_k[0], G2ij_k[3])
+            GxxG2zz_r_L, _ = self._safe_product_L(Gij_k[0], G2ij_k[5])
+            GyyG2xx_r_L, _ = self._safe_product_L(Gij_k[3], G2ij_k[0])
+            GyyG2zz_r_L, _ = self._safe_product_L(Gij_k[3], G2ij_k[5])
+            GzzG2xx_r_L, _ = self._safe_product_L(Gij_k[5], G2ij_k[0])
+            GzzG2yy_r_L, _ = self._safe_product_L(Gij_k[5], G2ij_k[3])
+
+            GxyG2xy_r_L, _ = self._safe_product_L(Gij_k[1], G2ij_k[1])
+            GxzG2xz_r_L, _ = self._safe_product_L(Gij_k[2], G2ij_k[2])
+            GyzG2yz_r_L, _ = self._safe_product_L(Gij_k[4], G2ij_k[4])
+
+            phi3b_r_L = 0.5* (GxxG2yy_r_L + GxxG2zz_r_L + GyyG2xx_r_L + GyyG2zz_r_L + GzzG2xx_r_L + GzzG2yy_r_L) \
+                          - (GxyG2xy_r_L + GxzG2xz_r_L + GyzG2yz_r_L)
+            '''
+            G2ij_r_pad  = self._irfftn_vec(G2ij_k_pad)
+            phi3b_r_pad = 0.5*Gij_r_pad[0]*(G2ij_r_pad[3]+G2ij_r_pad[5]) + 0.5*Gij_r_pad[3]*(G2ij_r_pad[0]+G2ij_r_pad[5]) + 0.5*Gij_r_pad[5]*(G2ij_r_pad[0]+G2ij_r_pad[3]) - Gij_r_pad[1]*G2ij_r_pad[1] - Gij_r_pad[2]*G2ij_r_pad[2] - Gij_r_pad[4]*G2ij_r_pad[4]
+            phi3b_k_pad = self.rfftn(phi3b_r_pad)
+            phi3b_k     = self.unpad_fields(phi3b_k_pad[None,...])[0]
+            phi3b_k_L   = self.pad_fields_L(phi3b_k[None,...])[0]
+            phi3b_r_L   = self.irfftn(phi3b_k_L)
             ### multiplying -10./21. results in one of the third order potential in LPT
             ### Gamma3 = -8/7 \phi^(3b)
-            Gamma3_r = -8./7.*phi3b_r
+            Gamma3_r_L = -8./7.*phi3b_r_L
+
+            # S3 = \psi_2 \cdot \nabla \delta_1
+            grad_delta_k     = coord.apply_grad_k(delta_k, self.kx, self.ky, self.kz)  # (3, ...)
+            grad_delta_k_pad = self.pad_fields(grad_delta_k) # (3, ...)
+            grad_delta_r_pad = self._irfftn_vec(grad_delta_k_pad)
+            disp2_k_pad = - (3./14.) * coord.apply_disp_k(G2_k_pad, self.kx_pad, self.ky_pad, self.kz_pad)  # (3, ...)
+            disp2_r_pad = self._irfftn_vec(disp2_k_pad)
+            S3_r_pad = jnp.einsum('i...,i...->...', disp2_r_pad, grad_delta_r_pad)
+            S3_k_pad = self.rfftn(S3_r_pad)
+            S3_k     = self.unpad_fields(S3_k_pad[None,...])[0]
+            S3_k_L   = self.pad_fields_L(S3_k[None,...])[0]
+            S3_r_L   = self.irfftn(S3_k_L)
 
             if self.renormalize:
-                d3_r  = d3_r - 3.*sigma2*delta_r
-                dG2_r = dG2_r + 4./3.*sigma2*delta_r
+                d3_r_L  = d3_r_L - 3.*sigma2_L*delta_r_L
+                dG2_r_L = dG2_r_L + 4./3.*sigma2_L*delta_r_L
 
-            fields.extend([d3_r - jnp.mean(d3_r), 
-                           dG2_r - jnp.mean(dG2_r), 
-                           G3_r - jnp.mean(G3_r), 
-                           Gamma3_r - jnp.mean(Gamma3_r)])
+            fields.extend([d3_r_L - jnp.mean(d3_r_L), 
+                           dG2_r_L - jnp.mean(dG2_r_L), 
+                           G3_r_L - jnp.mean(G3_r_L), 
+                           Gamma3_r_L - jnp.mean(Gamma3_r_L),
+                           S3_r_L - jnp.mean(S3_r_L),])
 
         return jnp.array(fields)
     
@@ -755,13 +1086,14 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
     def _tensor_fields_r(self, delta_k: jnp.ndarray) -> jnp.ndarray:
         r"""
         Build tensor fields in position space: [K_ij, dK_ij, H_ij, T_ij, ...]
+        ### to be modified as in the scalar case.
         Returns
         -------
         (n_fields, 6, ng, ng, ng) with order (xx,xy,xz,yy,yz,zz) in the 6-axis.
         """
         delta_k = delta_k.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
         
-        K_ij_k = coord.apply_Gij_k(delta_k, self.kx, self.ky, self.kz)  # (6, ng_L, ng_L, ng_L//2+1)
+        K_ij_k = coord.apply_Gij_k(delta_k, self.kx_L, self.ky_L, self.kz_L)  # (6, ng_L, ng_L, ng_L//2+1)
         K_ij_k = coord.apply_traceless(K_ij_k)
 
         fields = []
@@ -805,25 +1137,46 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
             H_ij_r = KK_ij_r - (1./3.)*dK_ij_r
 
             T_r = (delta_r*delta_r - 1.5 * K2_r).astype(self.real_dtype)
-            T_ij_k = coord.apply_Gij_k(self.rfftn(T_r), self.kx, self.ky, self.kz)  # (6, nx, ny, nzr)
+            T_ij_k = coord.apply_Gij_k(self.rfftn(T_r), self.kx_L, self.ky_L, self.kz_L)  # (6, nx, ny, nzr)
             T_ij_k = coord.apply_traceless(T_ij_k)
             T_ij_r = self._irfftn_vec(T_ij_k)  # (6, ng_L, ng_L, ng_L)
             T_ij_r = T_ij_r - jnp.mean(T_ij_r, axis=(1, 2, 3), keepdims=True)
 
             fields.extend([dK_ij_r, H_ij_r, T_ij_r])
 
-        return jnp.array(fields)
+        if self.bias_order >= 3:
+            ValueError("Third-order tensor fields not implemented yet.")
 
+        return jnp.array(fields)
+    
+    @staticmethod
+    @partial(jit, donate_argnums=(0,))
+    def to_lya_fields(fields_r: jnp.ndarray, growth_f: float) -> jnp.ndarray:
+        """
+        Rewrite fields along axis=0 for LyA combination.
+        The input buffer is donated to reduce peak memory if possible.
+        """
+        orig = fields_r
+
+        fac = 3./7. * growth_f
+
+        out = (orig
+               .at[0].set(orig[1])                      # new[0] = shifted_d
+               .at[1].set(orig[0] - fac * orig[4])      # new[1] = shifted_1 - fac * G2_zz
+               .at[4:7].set(orig[5:8])                  # new[4:7] = shifted_deta, shifted_eta2, shifted_KK_zz
+               )
+        return out
+    
     # -------- linear & quadratic helper fields (API preserved) --------
     @partial(jit, static_argnames=('self',))
-    def eta_r(self, delta_k_L):
-        return self.irfftn(self.eta_k(delta_k_L))
+    def eta_r(self, delta_k):
+        return self.irfftn(self.eta_k(delta_k))
 
     @partial(jit, static_argnames=('self',))
-    def eta_k(self, delta_k_L):
-        delta_k_L = delta_k_L.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
+    def eta_k(self, delta_k):
+        delta_k = delta_k.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
         mu2 = coord.mu2_grid(self.kx, self.ky, self.kz)
-        return delta_k_L * mu2
+        return delta_k * mu2
 
     @partial(jit, static_argnames=('self',))
     def d2_r(self, delta_k_L):
@@ -839,7 +1192,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
     @partial(jit, static_argnames=('self',))
     def G2_r(self, delta_k_L):
         delta_k_L = delta_k_L.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
-        Gij_k = coord.apply_Gij_k(delta_k_L, self.kx, self.ky, self.kz)
+        Gij_k = coord.apply_Gij_k(delta_k_L, self.kx_L, self.ky_L, self.kz_L)
         Gij_r = self._irfftn_vec(Gij_k)
         phi2_r = (Gij_r[0]*Gij_r[3] + Gij_r[3]*Gij_r[5] + Gij_r[5]*Gij_r[0]
                   - Gij_r[1]**2 - Gij_r[2]**2 - Gij_r[4]**2)
@@ -859,7 +1212,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
     @partial(jit, static_argnames=('self',))
     def G2_zz_k(self, delta_k_L):
         delta_k_L = delta_k_L.astype(self.complex_dtype)
-        return self.rfftn(self.G2_r(delta_k_L)) * coord.mu2_grid(self.kx, self.ky, self.kz)
+        return self.rfftn(self.G2_r(delta_k_L)) * coord.mu2_grid(self.kx_L, self.ky_L, self.kz_L)
 
     # LyA helpers
     @partial(jit, static_argnames=('self',))
@@ -888,7 +1241,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
     @partial(jit, static_argnames=('self',))
     def GG_zz_r(self, delta_k_L):
         delta_k_L = delta_k_L.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
-        Gij_k = coord.apply_Gij_k(delta_k_L, self.kx, self.ky, self.kz)
+        Gij_k = coord.apply_Gij_k(delta_k_L, self.kx_L, self.ky_L, self.kz_L)
         Gij_r = self._irfftn_vec(Gij_k)
         GG_zz = (Gij_r[2]**2 + Gij_r[4]**2 + Gij_r[5]**2)
         return GG_zz - jnp.mean(GG_zz)
@@ -912,7 +1265,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
     def Kij_k(self, delta_k_L):
         delta_k_L = delta_k_L.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
         
-        K_ij_k = coord.apply_Gij_k(delta_k_L, self.kx, self.ky, self.kz)  # (6, ng_L, ng_L, ng_L//2+1)
+        K_ij_k = coord.apply_Gij_k(delta_k_L, self.kx_L, self.ky_L, self.kz_L)  # (6, ng_L, ng_L, ng_L//2+1)
         K_ij_k = coord.apply_traceless(K_ij_k)
 
         return K_ij_k
@@ -979,7 +1332,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
         K2_r = K_ij_r[0]**2 + K_ij_r[3]**2 + K_ij_r[5]**2 + 2.0*(K_ij_r[1]**2 + K_ij_r[2]**2 + K_ij_r[4]**2)
         
         T_r = (delta_r*delta_r - 1.5 * K2_r).astype(self.real_dtype)
-        T_ij_k = coord.apply_Gij_k(self.rfftn(T_r), self.kx, self.ky, self.kz)  # (6, nx, ny, nzr)
+        T_ij_k = coord.apply_Gij_k(self.rfftn(T_r), self.kx_L, self.ky_L, self.kz_L)  # (6, nx, ny, nzr)
         T_ij_k = coord.apply_traceless(T_ij_k)
         T_ij_r = self._irfftn_vec(T_ij_k)  # (6, ng_L, ng_L, ng_L)
         T_ij_r = T_ij_r - jnp.mean(T_ij_r, axis=(1, 2, 3), keepdims=True)
@@ -1081,17 +1434,16 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
             - else              : (m, 6, ng_E, ng_E, ng_E),       real
         """
         delta_k = delta_k.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
-        delta_k_L = coord.func_extend(self.ng_L, delta_k)
 
         # lpt displacement
-        disp_r_L = self.lpt(delta_k_L, growth_f=growth_f)  # (3, ng, ng, ng)
+        disp_r_L = self.lpt(delta_k, growth_f=growth_f)  # (3, ng, ng, ng)
 
         # list of scalar fields in position space
         if field_type == 'scalar':
-            fields_r_L = self._scalar_fields_r(delta_k_L)    # (m, ng_L, ng_L, ng_L)
+            fields_r_L = self._scalar_fields_r(delta_k)    # (m, ng_L, ng_L, ng_L)
             m = int(fields_r_L.shape[0])
         elif field_type == 'tensor':
-            fields_r_L = self._tensor_fields_r(delta_k_L)    # (m, 6, ng_L, ng_L, ng_L)
+            fields_r_L = self._tensor_fields_r(delta_k)    # (m, 6, ng_L, ng_L, ng_L)
             m = int(fields_r_L.shape[0])
         else:
             raise ValueError("field_type must be 'scalar' or 'tensor'.")
@@ -1101,9 +1453,10 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
             if field_type != 'scalar':
                 raise NotImplementedError("2LPT correction only implemented for field_type='scalar'.")
             if self.bias_order < 2:
-                G2_k_L = self.G2_k(delta_k_L)
+                G2_k = self.G2_k(delta_k)
             else:
                 G2_k_L = self.rfftn(fields_r_L[3])
+                G2_k
             disp_r_L = disp_r_L - (3./14.) * self.lpt(G2_k_L, growth_f=growth_f).astype(self.real_dtype)
 
         # assign to Eularian grid (and FFT/deconv)
@@ -1137,6 +1490,697 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
             if field_type == 'tensor':
                 fields_r_E = fields_r_E.reshape(m, 6, *fields_r_E.shape[1:])
             return fields_r_E.astype(self.real_dtype)
+        
+    def get_shifted_fields_lightcone_fast(
+        self,
+        delta_k: jnp.ndarray,
+        *,
+        D_ic: float,      # D(z_ic)
+        chi_edges: jnp.ndarray, # (Ns+1,) chi(z_edges)
+        D_mid: jnp.ndarray,     # (Ns,)   D(z_mid)
+        beta_mid: jnp.ndarray,   # (num_fields, Ns) bias factors at z_mid for each field (only constant bias for each field)
+        observer_pos: Optional[jnp.ndarray] = None,  # (3,) in [0, boxsize)
+        growth_powers: Optional[jnp.ndarray] = None,     # (num_fields,)
+        f_mid: Optional[jnp.ndarray] = None,     # (Ns,)   growth rate at z_mid for RSD
+        mode: str = 'k_space',
+        field_type: Literal['scalar', 'tensor'] = 'scalar',
+        neighbor_mode: str = 'auto',
+        fuse_updates_threshold: int=100_000_000,
+    ) -> jnp.ndarray:
+        r"""
+        Shell-based light-cone construction.
+
+        For each slice i:
+          - uses Psi_ic and Lagrangian operators at z_ic
+          - scales them by D_mid[i]/D_ic and growth_powers
+          - keeps only cells with radius in [chi_edges[i], chi_edges[i+1])
+          - assigns to Eulerian grid and accumulates.
+        """
+        delta_k = delta_k.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
+
+        # lpt displacement, w/o RSD for lightcone construction
+        disp_r_L = self.lpt(delta_k, growth_f=0.0)  # (3, ng, ng, ng)
+
+        # list of scalar fields in position space
+        if field_type == 'scalar':
+            fields_r_L = self._scalar_fields_r(delta_k)    # (m, ng_L, ng_L, ng_L)
+            m = int(fields_r_L.shape[0])
+        elif field_type == 'tensor':
+            fields_r_L = self._tensor_fields_r(delta_k)    # (m, 6, ng_L, ng_L, ng_L)
+            m = int(fields_r_L.shape[0])
+        else:
+            raise ValueError("field_type must be 'scalar' or 'tensor'.")
+
+        # 2lpt correction
+        if self.lpt_order >= 2:
+            raise NotImplementedError("2LPT correction is not implemented for lightcone.")
+        
+        # observer position and Lagrangain coordinates
+        dq = self.boxsize / self.ng_L
+        q1d = (jnp.arange(self.ng_L, dtype=self.real_dtype)) * dq
+
+        if observer_pos is None:
+            observer_pos = jnp.array([0., 0., 0.], dtype=self.real_dtype)
+        else:
+            observer_pos = jnp.asarray(observer_pos, dtype=self.real_dtype)
+
+        qx_rel = (q1d - observer_pos[0])[:, None, None]
+        qy_rel = (q1d - observer_pos[1])[None, :, None]
+        qz_rel = (q1d - observer_pos[2])[None, None, :]
+
+        # growth powers (D(z)/D(z_ic))^n for each field
+        if field_type == 'scalar':
+            if growth_powers is None:
+                growth_powers = [0, 1, 2, 2,] ### for [1, d, d2, G2]
+            growth_powers = jnp.asarray(growth_powers, dtype=self.real_dtype)
+            if growth_powers.shape[0] != m:
+                raise ValueError("growth_powers length must match # scalar fields.")
+        elif field_type == "tensor":
+            if growth_powers is None:
+                growth_powers = [1, 2, 2, 2,] ### for [Kij, dKij, Hij, Tij]
+            growth_powers = jnp.asarray(growth_powers, dtype=self.real_dtype)
+            if growth_powers.shape[0] != m:
+                raise ValueError("growth_powers length must match # tensor fields.")
+
+        Ns = int(D_mid.shape[0])   ### Number of z-slices
+
+        W   = jnp.zeros((self.ng_L, self.ng_L, self.ng_L), dtype=self.real_dtype)  # eventually D_ratio(z_slice(q)) or 0
+        if self.rsd:
+            W_f = jnp.zeros((self.ng_L, self.ng_L, self.ng_L), dtype=self.real_dtype)
+
+        # loop over slices (Python for; you can turn into lax.fori_loop if Ns is small/static) ----
+        for i in range(Ns):
+            chi2_low = chi_edges[i] ** 2
+            chi2_high = chi_edges[i+1] ** 2
+            D_ratio = D_mid[i] / D_ic
+
+            # displacement at slice i
+            disp_r_L_i = disp_r_L * D_ratio   # (3, ng_L, ng_L, ng_L)
+            disp_x, disp_y, disp_z = disp_r_L_i
+
+            # relative positions in the periodic box
+            #dx = (qx_rel + disp_x) - self.boxsize * jnp.round((qx_rel + disp_x) / self.boxsize)
+            #dy = (qy_rel + disp_y) - self.boxsize * jnp.round((qy_rel + disp_y) / self.boxsize)
+            #dz = (qz_rel + disp_z) - self.boxsize * jnp.round((qz_rel + disp_z) / self.boxsize)
+
+            dx = (qx_rel + disp_x)
+            dy = (qy_rel + disp_y)
+            dz = (qz_rel + disp_z)
+
+            # distance at slice i
+            r2_i = dx*dx + dy*dy + dz*dz  # (ng_L, ng_L, ng_L)
+
+            # mask: which Lagrangian particles are in this shell?
+            in_shell = (r2_i >= chi2_low) & (r2_i < chi2_high)
+            in_shell_f = in_shell.astype(self.real_dtype)  ### zero for out-of-shell particles
+
+            W = W + D_ratio * in_shell_f # since each cell belongs to at most one slice, W(q)=D_ratio_j
+
+            # rescale bias operators
+            for a in range(m):
+                p_a = growth_powers[a]
+                beta_ai = beta_mid[a, i]
+
+                #  O_a_final = O_a_ic * D_ratio^p_a * beta_ai
+                factor_ai = (D_ratio ** p_a) * beta_ai
+                # multiply by factor_ai only inside shell; keep as-is outside
+                # mult = 1 outside, factor_ai inside
+                fac = (1.0 - in_shell_f) + factor_ai * in_shell_f
+                fields_r_L = fields_r_L.at[a].set(fields_r_L[a] * fac)
+            if self.rsd:
+                W_f = W_f + f_mid[i] * in_shell_f
+
+        mask_any = (W > 0.0).astype(self.real_dtype)  # 0 or 1
+
+        # final displacement
+        disp_r_L = disp_r_L * W[None, :, :, :]  # (3, ng_L, ng_L, ng_L)
+        if self.rsd:
+            disp_r_L = disp_r_L.at[2].add(disp_r_L[2] * W_f)  # (3, ng_L, ng_L, ng_L)
+
+        for a in range(m):
+            fields_r_L = fields_r_L.at[a].set(fields_r_L[a] * mask_any)
+
+        # assign to Eularian grid (and FFT/deconv)
+        if mode == 'k_space':
+            # Build non-interlaced and (optionally) interlaced stacks
+            fields_r_E  = self._assign_fields_from_disp_to_grid(disp_r_L, fields_r_L,
+                                                               interlace=False, normalize_mean=True,
+                                                               field_type=field_type,
+                                                               neighbor_mode=neighbor_mode,
+                                                               fuse_updates_threshold=fuse_updates_threshold)
+            fields_r_Ei  = None
+            if self.mesh.interlace:
+                fields_r_Ei = self._assign_fields_from_disp_to_grid(disp_r_L, fields_r_L,
+                                                                    interlace=True, normalize_mean=True,
+                                                                    field_type=field_type,
+                                                                    neighbor_mode=neighbor_mode,
+                                                                    fuse_updates_threshold=fuse_updates_threshold)
+            # Single batched FFT + deconvolution (provided by Mesh_Assignment)
+            fields_k = self.mesh.fft_deconvolve_batched(fields_r_E, fields_r_Ei)
+            if field_type == 'tensor':
+                # Reshape back to (m, 6, ng_E, ng_E, ng_E//2+1)
+                fields_k = fields_k.reshape(m, 6, *fields_k.shape[1:])
+            return fields_k.astype(self.complex_dtype)
+        else:
+            # Real-space: return non-interlaced assigned grids
+            fields_r_E = self._assign_fields_from_disp_to_grid(disp_r_L, fields_r_L,
+                                                               interlace=False, normalize_mean=True,
+                                                               field_type=field_type,
+                                                               neighbor_mode=neighbor_mode,
+                                                               fuse_updates_threshold=fuse_updates_threshold)
+            if field_type == 'tensor':
+                fields_r_E = fields_r_E.reshape(m, 6, *fields_r_E.shape[1:])
+            return fields_r_E.astype(self.real_dtype)
+
+    def get_shifted_fields_lightcone_bruteforce(
+        self,
+        delta_k: jnp.ndarray,
+        *,
+        D_ic: float,                       # D(z_ic)
+        chi_edges: jnp.ndarray,            # (Ns+1,)
+        D_mid: jnp.ndarray,                # (Ns,)
+        observer_pos: Optional[jnp.ndarray] = None,  # (3,)
+        growth_powers: jnp.ndarray,        # (n_fields0,)
+        # Optional RSD (fixed LOS axis); used only in assignment displacement
+        f_mid: Optional[jnp.ndarray] = None,         # (Ns,)
+        rsd_axis: int = 2,
+        # Ortho / beta(k,mu,z)
+        measure_pk=None,
+        k_edges: Optional[jnp.ndarray] = None,       # (Nk+1,)
+        mu_edges: Optional[jnp.ndarray] = None,      # (Nmu+1,)
+        beta_kmu_mid: jnp.ndarray = None,            # (Ns, n_fields_eff, Nk, Nmu)
+        Nmin: int = 5,
+        jitter: float = 0.0,
+        dtype=jnp.float32,
+        warn_on_low_stat: bool = True,
+        # Assignment controls
+        field_type: Literal["scalar", "tensor"] = "scalar",
+        neighbor_mode: str = "auto",
+        fuse_updates_threshold: int = 100_000_000,
+    ) -> jnp.ndarray:
+        """
+        Brute-force lightcone (Eulerian masking after orthogonalization):
+
+          For each slice s:
+            1) Assign FULL-BOX Eulerian fields at z_s (Zel'dovich displacement; RSD optional)
+            2) FFT+deconvolve and orthogonalize FULL-BOX fields in k-space
+            3) Multiply orthogonalized fields by beta(k,mu,z_s) (piecewise-constant per (k,mu) bin)
+               and sum over fields -> slice_k (single k-space field)
+            4) iFFT -> slice_r, apply Eulerian shell mask in real space, rFFT back
+            5) Accumulate into final_k
+
+        This reuses nearest_idx from utils_jax._build_nearest_idx_for_grid both for Mcoef expansion
+        inside orthogonalize (if used) and for expanding beta tables to the Fourier grid.
+
+        Notes:
+          - Shell selection is done in Eulerian grid (cell centers), not by particle membership in Lagrangian space.
+          - This will smear the shell boundary at roughly the assignment stencil scale.
+        """
+        # --- sanity checks ---
+        if field_type != "scalar":
+            raise NotImplementedError("This brute-force implementation currently supports field_type='scalar' only.")
+        if measure_pk is None or k_edges is None or mu_edges is None:
+            raise ValueError("measure_pk, k_edges, mu_edges are required.")
+        if beta_kmu_mid is None:
+            raise ValueError("beta_kmu_mid is required.")
+        if (self.rsd is True) and (f_mid is None):
+            raise ValueError("f_mid is required when self.rsd=True.")
+
+        # --- cast / normalize inputs ---
+        delta_k = jnp.asarray(delta_k, dtype=self.complex_dtype)
+        delta_k = delta_k.at[0, 0, 0].set(0.0)
+
+        chi_edges = jnp.asarray(chi_edges, dtype=self.real_dtype)
+        D_mid = jnp.asarray(D_mid, dtype=self.real_dtype)
+        Ns = int(D_mid.shape[0])
+        if chi_edges.shape[0] != Ns + 1:
+            raise ValueError("chi_edges must have shape (Ns+1,)")
+
+        k_edges = jnp.asarray(k_edges, dtype=self.real_dtype)
+        mu_edges = jnp.asarray(mu_edges, dtype=self.real_dtype)
+        Nk = int(k_edges.shape[0] - 1)
+        Nmu = int(mu_edges.shape[0] - 1)
+
+        # --- base Lagrangian displacement/operators at IC ---
+        disp_r_L0 = self.lpt(delta_k, growth_f=0.0)  # (3, ng_L, ng_L, ng_L)
+        fields_r_L0 = self._scalar_fields_r(delta_k)  # (n_fields0, ng_L, ng_L, ng_L)
+        n_fields0 = int(fields_r_L0.shape[0])
+
+        growth_powers = jnp.asarray(growth_powers, dtype=self.real_dtype)
+        if growth_powers.shape[0] != n_fields0:
+            raise ValueError(f"growth_powers must have length {n_fields0}, got {growth_powers.shape[0]}")
+
+        # If you remap LyA operators and then drop the last field, define the effective count here.
+        lya_reduce = (self.lya is True) and (self.rsd is True)
+        n_fields_eff = n_fields0 - 1 if lya_reduce else n_fields0
+
+        beta_kmu_mid = jnp.asarray(beta_kmu_mid, dtype=jnp.asarray(0.0, dtype=dtype).dtype)
+        if beta_kmu_mid.shape[:4] != (Ns, n_fields_eff, Nk, Nmu):
+            raise ValueError(f"beta_kmu_mid must have shape (Ns, n_fields_eff, Nk, Nmu) = {(Ns, n_fields_eff, Nk, Nmu)}")
+
+        # --- observer position and Eulerian radius grid (cell centers) ---
+        if observer_pos is None:
+            observer_pos = jnp.array([0.0, 0.0, 0.0], dtype=self.real_dtype)
+        else:
+            observer_pos = jnp.asarray(observer_pos, dtype=self.real_dtype)
+
+        ng_E = int(self.ng_E)
+        dx_E = self.boxsize / ng_E
+        # Cell-center convention: here we use x = i*dx (match your earlier convention).
+        x1d = (jnp.arange(ng_E, dtype=self.real_dtype)) * dx_E
+        x_rel = (x1d - observer_pos[0])[:, None, None]
+        y_rel = (x1d - observer_pos[1])[None, :, None]
+        z_rel = (x1d - observer_pos[2])[None, None, :]
+        r2_grid = x_rel * x_rel + y_rel * y_rel + z_rel * z_rel  # (ng_E, ng_E, ng_E)
+
+        # --- build nearest_idx once and reuse it for beta expansion ---
+        # nearest_idx maps (kbin, mubin) -> flat index (kbin*Nmu + mubin) for each Fourier grid point.
+        nearest_idx, Nk_chk, Nmu_chk = utils_jax._build_nearest_idx_for_grid(
+            ng_E, self.boxsize, k_edges, mu_edges, dtype=self.real_dtype
+        )
+        if (Nk_chk != Nk) or (Nmu_chk != Nmu):
+            raise ValueError("Inconsistent Nk/Nmu returned by _build_nearest_idx_for_grid.")
+
+        # Helper: expand a (Nk,Nmu) table onto the rfft grid via nearest_idx
+        def _expand_table_to_grid(table_NkNmu: jnp.ndarray) -> jnp.ndarray:
+            flat = table_NkNmu.reshape(Nk * Nmu)
+            return jnp.take(flat, nearest_idx, axis=0)  # (ng_E, ng_E, ng_E//2+1)
+
+        # --- accumulator in k-space ---
+        final_k = jnp.zeros((ng_E, ng_E, ng_E // 2 + 1), dtype=self.complex_dtype)
+
+        for s in range(Ns):
+            chi2_low = chi_edges[s] ** 2
+            chi2_high = chi_edges[s + 1] ** 2
+
+            # Eulerian shell mask on the grid (no displacement, no RSD)
+            in_shell = (r2_grid >= chi2_low) & (r2_grid < chi2_high)
+            in_shell_f = in_shell.astype(self.real_dtype)
+
+            # Growth scaling for this slice
+            D_ratio = jnp.asarray(D_mid[s] / D_ic, dtype=self.real_dtype)
+            scale = jnp.power(D_ratio, growth_powers).astype(self.real_dtype)  # (n_fields0,)
+
+            # Build slice displacement (Zel'dovich), apply RSD only in assignment
+            disp_r_L = disp_r_L0 * D_ratio
+            disp_r_L_assign = disp_r_L
+            if self.rsd is True:
+                gf = jnp.asarray(f_mid[s], dtype=self.real_dtype)
+                disp_r_L_assign = disp_r_L_assign.at[rsd_axis].add(disp_r_L_assign[rsd_axis] * gf)
+
+            # Full-box Lagrangian operators for this slice (no mask here)
+            fields_r_L_full = fields_r_L0 * scale[:, None, None, None]  # (n_fields0, ng_L, ng_L, ng_L)
+
+            # Optional LyA operator remapping (must match how beta_kmu_mid was defined)
+            if lya_reduce:
+                gf = jnp.asarray(f_mid[s], dtype=self.real_dtype)
+                fields_r_L_full = self.to_lya_fields(fields_r_L_full, gf)[:-1]  # (n_fields_eff, ...)
+
+            # Assign FULL-BOX -> Eulerian grid (real space)
+            fields_r_E = self._assign_fields_from_disp_to_grid(
+                disp_r_L_assign,
+                fields_r_L_full,
+                interlace=False,
+                normalize_mean=True,
+                field_type="scalar",
+                neighbor_mode=neighbor_mode,
+                fuse_updates_threshold=fuse_updates_threshold,
+            )
+            fields_r_Ei = None
+            if self.mesh.interlace:
+                fields_r_Ei = self._assign_fields_from_disp_to_grid(
+                    disp_r_L_assign,
+                    fields_r_L_full,
+                    interlace=True,
+                    normalize_mean=True,
+                    field_type="scalar",
+                    neighbor_mode=neighbor_mode,
+                    fuse_updates_threshold=fuse_updates_threshold,
+                )
+
+            # FFT + deconvolution (full box)
+            fields_k_full = self.mesh.fft_deconvolve_batched(fields_r_E, fields_r_Ei).astype(self.complex_dtype)
+            fields_k_full = fields_k_full.at[:, 0, 0, 0].set(0.0)
+
+            # Orthonormalize FULL-BOX fields in k-space (no Mcoef returned)
+            fields_k_ortho = utils_jax.orthogonalize(
+                fields_k_full,
+                measure_pk,
+                self.boxsize,
+                k_edges,
+                mu_edges,
+                Nmin=Nmin,
+                jitter=jitter,
+                dtype=dtype,
+                warn_on_low_stat=warn_on_low_stat,
+                return_Mcoef=False,
+                return_nearest_idx=False,
+            ).astype(self.complex_dtype)
+            fields_k_ortho = fields_k_ortho.at[:, 0, 0, 0].set(0.0)
+
+            # Apply beta(k,mu,z_s) to orthogonalized fields and sum in k-space
+            beta_table_s = beta_kmu_mid[s]  # (n_fields_eff, Nk, Nmu)
+            slice_k = jnp.zeros((ng_E, ng_E, ng_E // 2 + 1), dtype=self.complex_dtype)
+            for j in range(n_fields_eff):
+                beta_grid = _expand_table_to_grid(beta_table_s[j]).astype(self.real_dtype)
+                slice_k = slice_k + (beta_grid * fields_k_ortho[j]).astype(self.complex_dtype)
+            slice_k = slice_k.at[0, 0, 0].set(0.0)
+
+            # Go to real space, apply Eulerian shell mask, go back to k-space
+            slice_r = self.irfftn(slice_k).astype(self.real_dtype)  # consistent with your norm='forward'
+            slice_r = (slice_r * in_shell_f).astype(self.real_dtype)
+
+            slice_k_masked = self.rfftn(slice_r).astype(self.complex_dtype)
+            slice_k_masked = slice_k_masked.at[0, 0, 0].set(0.0)
+
+            final_k = final_k + slice_k_masked
+
+        return final_k.astype(self.complex_dtype)
+
+    def _get_shifted_fields_lightcone_bruteforce_(
+        self,
+        delta_k: jnp.ndarray,
+        *,
+        D_ic: float,                       # D(z_ic)
+        chi_edges: jnp.ndarray,            # (Ns+1,)
+        D_mid: jnp.ndarray,                # (Ns,)
+        observer_pos: Optional[jnp.ndarray] = None,  # (3,)
+        growth_powers: jnp.ndarray, # (n_fields,)
+        # Optional RSD (fixed LOS axis); only used for FINAL displacement in assignment
+        f_mid: Optional[jnp.ndarray] = None,         # (Ns,)
+        rsd_axis: int = 2,
+        # Ortho / beta(k,mu,z)
+        measure_pk=None,
+        k_edges: Optional[jnp.ndarray] = None,       # (Nk+1,)
+        mu_edges: Optional[jnp.ndarray] = None,      # (Nmu+1,)
+        beta_kmu_mid: jnp.ndarray,  # (Ns, n_fields, Nk, Nmu)
+        Nmin: int = 5,
+        jitter: float = 0.0,
+        dtype=jnp.float32,
+        # Assignment / output
+        field_type: Literal["scalar", "tensor"] = "scalar",
+        neighbor_mode: str = "auto",
+        fuse_updates_threshold: int = 100_000_000,
+        # Performance
+        recompute_M_every: int = 1,  # compute Mcoef every N slices; reuse otherwise
+        warn_on_low_stat: bool = True,
+    ) -> jnp.ndarray:
+        """
+        Slice-by-slice brute-force lightcone:
+          1) Build IC Lagrangian displacement and operators once.
+          2) For each z-slice:
+               - compute in-shell mask in Lagrangian space (no periodic wrap by default)
+               - assign masked operators to Eulerian grid and FFT
+               - (optionally) recompute Mcoef(k,mu) using full-box fields for that slice
+               - apply Mcoef and beta_j(k,mu,z_slice) to the masked fields
+               - sum over fields and accumulate into final_k
+          3) Return final_k.
+
+        Notes:
+          - Operators are still scaled by (D_mid/D_ic)^{growth_powers} if growth_powers is provided.
+          - beta_kmu_mid must be per-slice and per-field: (Ns, n_fields, Nk, Nmu).
+        """
+        if measure_pk is None or k_edges is None or mu_edges is None:
+            raise ValueError("measure_pk, k_edges, mu_edges are required to compute Mcoef(k,mu).")
+        if self.rsd is True and f_mid is None:
+            raise ValueError("f_mid is required for RSD")
+
+        delta_k = delta_k.at[0, 0, 0].set(0.0).astype(self.complex_dtype)
+
+        # --- base Lagrangian displacement at IC (no RSD for selection) ---
+        disp_r_L0 = self.lpt(delta_k, growth_f=0.0)  # (3, ng_L, ng_L, ng_L)
+
+        # --- base Lagrangian operators at IC ---
+        if field_type == "scalar":
+            fields_r_L0 = self._scalar_fields_r(delta_k)    # (n_fields, ng_L, ng_L, ng_L)
+        elif field_type == "tensor":
+            fields_r_L0 = self._tensor_fields_r(delta_k)    # (n_fields, 6, ng_L, ng_L, ng_L)
+        else:
+            raise ValueError("field_type must be 'scalar' or 'tensor'.")
+
+        n_fields = int(fields_r_L0.shape[0])
+        if self.rsd is True:
+            if self.bias_order == 2:
+                n_fields -= 1
+        Ns = int(D_mid.shape[0])
+
+        # --- growth powers for operator evolution ---
+        growth_powers = jnp.asarray(growth_powers, dtype=self.real_dtype)
+
+        # --- beta(k,mu,z) ---
+        Nk = int(k_edges.shape[0] - 1)
+        Nmu = int(mu_edges.shape[0] - 1)
+        beta_kmu_mid = jnp.asarray(beta_kmu_mid, dtype=dtype)
+        if beta_kmu_mid.shape[:4] != (Ns, n_fields, Nk, Nmu):
+            raise ValueError(f"beta_kmu_mid must have shape (Ns, n_fields, Nk, Nmu) = {(Ns,n_fields,Nk,Nmu)}")
+
+        # --- observer position and Lagrangian coordinate axes ---
+        if observer_pos is None:
+            observer_pos = jnp.array([0.0, 0.0, 0.0], dtype=self.real_dtype)
+        else:
+            observer_pos = jnp.asarray(observer_pos, dtype=self.real_dtype)
+
+        dq = self.boxsize / self.ng_L
+        q1d = (jnp.arange(self.ng_L, dtype=self.real_dtype)) * dq
+        qx_rel = (q1d - observer_pos[0])[:, None, None]
+        qy_rel = (q1d - observer_pos[1])[None, :, None]
+        qz_rel = (q1d - observer_pos[2])[None, None, :]
+
+        # --- output accumulator in Fourier space ---
+        final_k = None
+
+        # --- cached Mcoef / nearest_idx ---
+        Mcoef_cached = None
+        nearest_idx_cached = None
+
+        for s in range(Ns):
+            chi2_low = chi_edges[s] ** 2
+            chi2_high = chi_edges[s + 1] ** 2
+            D_ratio = jnp.asarray(D_mid[s] / D_ic, dtype=self.real_dtype)
+
+            # --- displacement for this slice (selection uses no RSD) ---
+            disp_r_L = disp_r_L0 * D_ratio
+            disp_x, disp_y, disp_z = disp_r_L
+
+            # --- shell membership test (no periodic wrapping by default) ---
+            dx = qx_rel + disp_x
+            dy = qy_rel + disp_y
+            dz = qz_rel + disp_z
+            r2 = dx * dx + dy * dy + dz * dz
+            in_shell = (r2 >= chi2_low) & (r2 < chi2_high)
+            in_shell_f = in_shell.astype(self.real_dtype)  # (ng_L, ng_L, ng_L)
+
+            # --- scale operators by growth power for this slice ---
+            scale = jnp.power(D_ratio, growth_powers).astype(self.real_dtype)  # (n_fields,)
+
+            if field_type == "scalar":
+                # (n_fields, ng_L, ng_L, ng_L)
+                fields_r_L_mask = (fields_r_L0 * scale[:, None, None, None]) * in_shell_f[None, :, :, :]
+                if (self.lya is True) and (self.rsd is True):
+                    gf = jnp.asarray(f_mid[s], dtype=self.real_dtype)
+                    fields_r_L_mask = self.to_lya_fields(fields_r_L_mask, gf)[:-1]
+            else:
+                # (n_fields, 6, ng_L, ng_L, ng_L)
+                fields_r_L_mask = (fields_r_L0 * scale[:, None, None, None, None]) * in_shell_f[None, None, :, :, :]
+
+            # --- displacement for assignment (RSD only here, if requested) ---
+            disp_r_L_assign = disp_r_L
+            if self.rsd is True:
+                gf = jnp.asarray(f_mid[s], dtype=self.real_dtype)
+                disp_r_L_assign = disp_r_L_assign.at[rsd_axis].add(disp_r_L_assign[rsd_axis] * gf)
+
+            # --- assign masked fields -> Eulerian grid ---
+            fields_r_E = self._assign_fields_from_disp_to_grid(
+                disp_r_L_assign,
+                fields_r_L_mask,
+                interlace=False,
+                normalize_mean=True,
+                field_type=field_type,
+                neighbor_mode=neighbor_mode,
+                fuse_updates_threshold=fuse_updates_threshold,
+            )
+            fields_r_Ei = None
+            if self.mesh.interlace:
+                fields_r_Ei = self._assign_fields_from_disp_to_grid(
+                    disp_r_L_assign,
+                    fields_r_L_mask,
+                    interlace=True,
+                    normalize_mean=True,
+                    field_type=field_type,
+                    neighbor_mode=neighbor_mode,
+                    fuse_updates_threshold=fuse_updates_threshold,
+                )
+
+            # --- FFT + deconvolution ---
+            fields_k_mask = self.mesh.fft_deconvolve_batched(fields_r_E, fields_r_Ei).astype(self.complex_dtype)
+
+            # --- (re)compute Mcoef using FULL-BOX (no mask) fields ---
+            if (Mcoef_cached is None) or (recompute_M_every > 0 and (s % recompute_M_every == 0)):
+                if field_type == "scalar":
+                    fields_r_L_full = fields_r_L0 * scale[:, None, None, None]
+                    if (self.lya is True) and (self.rsd is True):
+                        gf = jnp.asarray(f_mid[s], dtype=self.real_dtype)
+                        fields_r_L_full = self.to_lya_fields(fields_r_L_full, gf)[:-1]
+                else:
+                    fields_r_L_full = fields_r_L0 * scale[:, None, None, None, None]
+
+                fields_r_E_full = self._assign_fields_from_disp_to_grid(
+                    disp_r_L_assign,
+                    fields_r_L_full,
+                    interlace=False,
+                    normalize_mean=True,
+                    field_type=field_type,
+                    neighbor_mode=neighbor_mode,
+                    fuse_updates_threshold=fuse_updates_threshold,
+                )
+                fields_r_Ei_full = None
+                if self.mesh.interlace:
+                    fields_r_Ei_full = self._assign_fields_from_disp_to_grid(
+                        disp_r_L_assign,
+                        fields_r_L_full,
+                        interlace=True,
+                        normalize_mean=True,
+                        field_type=field_type,
+                        neighbor_mode=neighbor_mode,
+                        fuse_updates_threshold=fuse_updates_threshold,
+                    )
+
+                fields_k_full = self.mesh.fft_deconvolve_batched(fields_r_E_full, fields_r_Ei_full).astype(self.complex_dtype)
+
+                # orthogonalize must be patched to return (Mcoef, nearest_idx) when return_Mcoef=True.
+                Mcoef_cached, nearest_idx_cached = utils_jax.orthogonalize(
+                    fields_k_full,
+                    measure_pk,
+                    self.boxsize,
+                    k_edges,
+                    mu_edges,
+                    Nmin=Nmin,
+                    jitter=jitter,
+                    dtype=dtype,
+                    warn_on_low_stat=warn_on_low_stat,
+                    return_Mcoef=True,
+                    return_nearest_idx=True,
+                )
+
+            # --- apply Mcoef and beta(k,mu,z_slice) ---
+            beta_table_s = beta_kmu_mid[s]  # (n_fields, Nk, Nmu)
+            fields_k_out = utils_jax.apply_Mcoef(
+                fields_k_mask,
+                Mcoef_cached,
+                nearest_idx_cached,
+                beta_table=beta_table_s,
+                apply_beta=True,
+            )
+
+            # --- accumulate final field (sum over orthogonalized fields) ---
+            slice_k = jnp.sum(fields_k_out, axis=0)
+            final_k = slice_k if (final_k is None) else (final_k + slice_k)
+
+        return final_k.astype(self.complex_dtype)
+    
+    def get_noise_lightcone(
+        self,
+        white_noise_k: jnp.ndarray,
+        *,
+        chi_edges: jnp.ndarray,            # (Ns+1,)
+        observer_pos: Optional[jnp.ndarray] = None,  # (3,)
+        rsd_axis: int = 2,
+        # Ortho / beta(k,mu,z)
+        measure_pk=None,
+        k_edges: Optional[jnp.ndarray] = None,       # (Nk+1,)
+        mu_edges: Optional[jnp.ndarray] = None,      # (Nmu+1,)
+        noise_kmu_mid: jnp.ndarray = None,           # (Ns, Nk, Nmu)
+        dtype=jnp.float32,
+    ) -> jnp.ndarray:
+        """
+        Build a light-cone noise field by:
+          (1) scaling a white-noise GRF in k-space to match Perr(k, mu) for each z-slice
+              using bin-containment lookup over (k, mu) with utils_jax._build_nearest_idx_for_grid,
+          (2) transforming to real space, masking cells outside the [chi_s, chi_{s+1}) shell
+              (Eulerian selection; no displacement),
+          (3) transforming back to k-space and accumulating across slices.
+
+        Notes
+        -----
+        - (k, mu) binning is now CONSISTENT with orthogonalize(): k-bin by k^2 within edges,
+          mu-bin by mu^2 within edges (no midpoint-nearest).
+        - mu is effectively |kz|/|k| since we use kz^2/k^2 (range [0,1]).
+        """
+        # --- sanity checks ---
+        if k_edges is None or mu_edges is None:
+            raise ValueError("k_edges, mu_edges are required.")
+        if noise_kmu_mid is None:
+            raise ValueError("noise_kmu_mid is required.")
+
+        white_noise_k = jnp.asarray(white_noise_k, dtype=self.complex_dtype)
+        white_noise_k = white_noise_k.at[0, 0, 0].set(0.0)  # force DC=0
+
+        # Ensure volume is ready
+        inv2V = jnp.array(0.5 / self.vol, dtype=self.real_dtype)
+
+        # --- bin-containment index on the rfft grid (built once, reused across slices) ---
+        # Use ng_E because white_noise_k is assumed to live on the Eulerian grid.
+        ng_E = int(self.ng_E)
+        k_edges = jnp.asarray(k_edges, dtype=self.real_dtype)
+        mu_edges = jnp.asarray(mu_edges, dtype=self.real_dtype)
+
+        nearest_idx, Nk, Nmu = utils_jax._build_nearest_idx_for_grid(
+            ng_E, self.boxsize, k_edges, mu_edges, dtype=self.real_dtype
+        )
+
+        # --- observer location and Eulerian coordinates (cell centers) ---
+        if observer_pos is None:
+            observer_pos = jnp.array([0.0, 0.0, 0.0], dtype=self.real_dtype)
+        else:
+            observer_pos = jnp.asarray(observer_pos, dtype=self.real_dtype)
+
+        dx = self.boxsize / ng_E
+        x1d = (jnp.arange(ng_E, dtype=self.real_dtype)) * dx
+        x_rel = (x1d - observer_pos[0])[:, None, None]
+        y_rel = (x1d - observer_pos[1])[None, :, None]
+        z_rel = (x1d - observer_pos[2])[None, None, :]
+        r2_grid = x_rel * x_rel + y_rel * y_rel + z_rel * z_rel  # (ng_E, ng_E, ng_E)
+
+        # --- accumulator in k-space ---
+        final_k = jnp.zeros_like(white_noise_k, dtype=self.complex_dtype)
+
+        # --- main loop over slices ---
+        chi_edges = jnp.asarray(chi_edges, dtype=self.real_dtype)
+        Ns = int(chi_edges.shape[0] - 1)
+
+        noise_kmu_mid = jnp.asarray(noise_kmu_mid, dtype=self.real_dtype)
+        if noise_kmu_mid.shape[:3] != (Ns, Nk, Nmu):
+            raise ValueError(f"noise_kmu_mid must have shape (Ns, Nk, Nmu) = {(Ns, Nk, Nmu)}")
+
+        for s in range(Ns):
+            # --- target Perr table for this slice ---
+            Perr_table = noise_kmu_mid[s]  # (Nk, Nmu)
+
+            # --- expand Perr(k,mu) table onto the rfft grid via nearest_idx ---
+            Perr_grid = jnp.take(Perr_table.reshape(Nk * Nmu), nearest_idx, axis=0)
+            Perr_grid = Perr_grid.at[0, 0, 0].set(0.0)  # ensure DC=0
+
+            # --- scale white noise in k-space to match Perr(k,mu) ---
+            amp = jnp.sqrt(jnp.maximum(Perr_grid, 0.0) * inv2V).astype(self.real_dtype)
+            slice_k = (amp * white_noise_k).astype(self.complex_dtype)
+
+            # --- go to real space, apply Eulerian shell mask, and go back to k-space ---
+            slice_r = jnp.fft.irfftn(slice_k, s=(ng_E, ng_E, ng_E), norm="ortho").astype(self.real_dtype)
+
+            chi2_low = chi_edges[s] ** 2
+            chi2_high = chi_edges[s + 1] ** 2
+            in_shell = (r2_grid >= chi2_low) & (r2_grid < chi2_high)
+
+            slice_r_masked = jnp.where(in_shell, slice_r, 0.0).astype(self.real_dtype)
+
+            slice_k_masked = jnp.fft.rfftn(slice_r_masked, norm="ortho").astype(self.complex_dtype)
+            slice_k_masked = slice_k_masked.at[0, 0, 0].set(0.0)
+
+            # --- accumulate ---
+            final_k = final_k + slice_k_masked
+
+        return final_k.astype(self.complex_dtype)
+
 
 # ------------------------------ EPT ------------------------------
 
@@ -1167,10 +2211,10 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
         self.pt_order = int(pt_order)
         self.bias_order = int(bias_order)
 
-        self.kxE, self.kyE, self.kzE = coord.kaxes_1d(self.ng_E, self.boxsize, dtype=self.real_dtype)
-        self.kx2E = self.kxE * self.kxE
-        self.ky2E = self.kyE * self.kyE
-        self.kz2E = self.kzE * self.kzE
+        self.kx_E, self.ky_E, self.kz_E = coord.kaxes_1d(self.ng_E, self.boxsize, dtype=self.real_dtype)
+        self.kx2_E = self.kx_E * self.kx_E
+        self.ky2_E = self.ky_E * self.ky_E
+        self.kz2_E = self.kz_E * self.kz_E
 
         # Small cache for 'nearest' interpolation map
         self._nearest_idx = None       # int32 indices of shape (ng_E, ng_E, ng_E//2+1)
@@ -1200,7 +2244,7 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
             d2_k = self.rfftn(d2_r).astype(self.complex_dtype)
 
             # Gij and G2
-            Gij_k = coord.apply_Gij_k(delta_k, self.kx, self.ky, self.kz)   # (6, k)
+            Gij_k = coord.apply_Gij_k(delta_k, self.kx_L, self.ky_L, self.kz_L)   # (6, k)
             Gij_r = self._irfftn_vec(Gij_k)                                 # (6, r)
             # indices: 0:xx, 1:xy, 2:xz, 3:yy, 4:yz, 5:zz
             phi2 = (Gij_r[0]*Gij_r[3] + Gij_r[3]*Gij_r[5] + Gij_r[5]*Gij_r[0]
@@ -1211,8 +2255,8 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
             
         if self.pt_order == 2:
             # 4) \Psi \nabla \delta term (both as real 3-vectors)
-            disp1_k = coord.apply_disp_k(delta_k, self.kx, self.ky, self.kz)   # (3, k),
-            grad1_k = coord.apply_nabla_k(delta_k, self.kx, self.ky, self.kz)  # (3, k), +i k * \delta
+            disp1_k = coord.apply_disp_k(delta_k, self.kx_L, self.ky_L, self.kz_L)   # (3, k),
+            grad1_k = coord.apply_nabla_k(delta_k, self.kx_L, self.ky_L, self.kz_L)  # (3, k), +i k * \delta
 
             disp1_r = self._irfftn_vec(disp1_k)  # (3, r)
             grad1_r = self._irfftn_vec(grad1_k)  # (3, r)
@@ -1225,6 +2269,7 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
             fields[0] = (fields[0] + F2_k)  # delta_k += F2_k
             fields[0] = fields[0].at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
         elif self.pt_order > 2:
+            self._ensure_kaxes()
             delta_m_r_ = self.gridspt(delta_k, pt_order=self.pt_order, ng=int(2.*self.ng_L/3))
             delta_m_r = jnp.sum(delta_m_r_, axis=0)  # sum over pt_order
             delta_m_k = self.rfftn(delta_m_r)  # (ng_L, ng_L, ng_L//2+1)
@@ -1248,7 +2293,7 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
         """
         delta_k = delta_k.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
         
-        K_ij_k = coord.apply_Gij_k(delta_k, self.kx, self.ky, self.kz)  # (6, ng_L, ng_L, ng_L//2+1)
+        K_ij_k = coord.apply_Gij_k(delta_k, self.kx_L, self.ky_L, self.kz_L)  # (6, ng_L, ng_L, ng_L//2+1)
         K_ij_k = coord.apply_traceless(K_ij_k)
 
         fields = []
@@ -1287,7 +2332,7 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
             H_ij_k = H_ij_k.at[:,0,0,0].set(0.0).astype(self.complex_dtype)
 
             T_r = (delta_r*delta_r - 1.5 * K2_r).astype(self.real_dtype)
-            T_ij_k = coord.apply_Gij_k(self.rfftn(T_r), self.kx, self.ky, self.kz)  # (6, ng_L, ng_L, ng_L//2+1)
+            T_ij_k = coord.apply_Gij_k(self.rfftn(T_r), self.kx_L, self.ky_L, self.kz_L)  # (6, ng_L, ng_L, ng_L//2+1)
             T_ij_k = coord.apply_traceless(T_ij_k)
             T_ij_k = T_ij_k.at[:,0,0,0].set(0.0).astype(self.complex_dtype)
 
@@ -1365,9 +2410,14 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
         else:
             raise ValueError("field_type must be 'scalar' or 'tensor'.")
 
-    def gridspt(self, delta_k_L: jnp.ndarray, pt_order: Optional[int] = None, ng: Optional[int] = None) -> jnp.ndarray:
+    def gridspt(
+            self, 
+            delta_k: jnp.ndarray, 
+            pt_order: Optional[int] = None, 
+            ng: Optional[int] = None,
+            ) -> jnp.ndarray:
         r"""
-        Eulerian SPT on the large grid (ng_L) with de-aliasing controlled by (ng, ng_L).
+        Eulerian SPT on the ng grid with de-aliasing controlled by (ng, ng_L).
 
         Strategy:
           - Low-pass the linear field once so it matches the target passband implied by ng.
@@ -1375,8 +2425,8 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
 
         Inputs
         ------
-        delta_k_L : (ng_L, ng_L, ng_L//2+1) complex
-            Linear density on the large rfftn layout. If not on ng_L, it is promoted/reduced.
+        delta_k : (ng, ng, ng//2+1) complex
+            Linear density on the large rfftn layout.
         pt_order : int or None
             Maximum order (defaults to self.pt_order).
         ng : int or None
@@ -1385,8 +2435,8 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
 
         Returns
         -------
-        deltas_r : (pt_order, ng_L, ng_L, ng_L) real
-            Real-space fields [delta_1, delta_2, ..., delta_pt] on the large grid.
+        deltas_r : (pt_order, ng, ng, ng) real
+            Real-space fields [delta_1, delta_2, ..., delta_pt] on the ng grid.
         """
 
         if pt_order is None:
@@ -1419,25 +2469,25 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
         delta_k = delta_k.at[0, 0, 0].set(0.0)
 
         # Build a cubic passband mask that matches "reduce to ng_eff".
-        ngL = int(self.ng_L)
-        half = int(ng_eff) // 2
-        idx_xy = jnp.arange(ngL)
-        mx = (idx_xy < half) | (idx_xy >= (ngL - half))          # (ng_L,)
-        mz = jnp.arange(ngL // 2 + 1) <= half                    # (ng_L//2+1,)
-        lpf_mask = (mx[:, None, None] & mx[None, :, None] & mz[None, None, :]).astype(self.real_dtype)
-        lpf_mask_c = lpf_mask.astype(self.complex_dtype)
+        #ngL = int(self.ng_L)
+        #half = int(ng_eff) // 2
+        #idx_xy = jnp.arange(ngL)
+        #mx = (idx_xy < half) | (idx_xy >= (ngL - half))          # (ng_L,)
+        #mz = jnp.arange(ngL // 2 + 1) <= half                    # (ng_L//2+1,)
+        #lpf_mask = (mx[:, None, None] & mx[None, :, None] & mz[None, None, :]).astype(self.real_dtype)
+        #lpf_mask_c = lpf_mask.astype(self.complex_dtype)
 
         # Initial low-pass once for the linear field.
-        del1_k = (delta_k * lpf_mask_c).at[0, 0, 0].set(0.0)
-        the1_k = del1_k  # EdS closure
+        #del1_k = (delta_k * lpf_mask_c).at[0, 0, 0].set(0.0)
+        #the1_k = delta_k  # EdS closure
 
-        delk = [del1_k]                   # list of k-space fields per order
-        thek = [the1_k]
-        deltas_r = [self.irfftn(del1_k)]  # real-space outputs per order
+        delk = [delta_k]                   # list of k-space fields per order
+        thek = [delta_k]
+        deltas_r = [self.irfftn(delta_k)]  # real-space outputs per order
 
         # Main recursion for orders >= 2.
         for n in range(2, pt_order + 1):
-            Sd_r = jnp.zeros((ngL, ngL, ngL), dtype=self.real_dtype)
+            Sd_r = jnp.zeros((ng, ng, ng), dtype=self.real_dtype)
             St_r = jnp.zeros_like(Sd_r)
 
             for m in range(1, n):
@@ -1455,8 +2505,11 @@ class EPT_Forward(Base_Forward, Beta_Combine_Mixin):
             theta_n_r = coef * (1.5 * Sd_r + n * St_r)
 
             # Post low-pass so the next iteration sees band-limited inputs.
-            delta_n_k = (self.rfftn(delta_n_r) * lpf_mask_c).at[0, 0, 0].set(0.0)
-            theta_n_k = (self.rfftn(theta_n_r) * lpf_mask_c).at[0, 0, 0].set(0.0)
+            #delta_n_k = (self.rfftn(delta_n_r) * lpf_mask_c).at[0, 0, 0].set(0.0)
+            #theta_n_k = (self.rfftn(theta_n_r) * lpf_mask_c).at[0, 0, 0].set(0.0)
+
+            delta_n_k = self.rfftn(delta_n_r).at[0,0,0].set(0.0)
+            theta_n_k = self.rfftn(theta_n_r).at[0,0,0].set(0.0)
 
             delk.append(delta_n_k)
             thek.append(theta_n_k)
