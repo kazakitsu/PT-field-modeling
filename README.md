@@ -37,7 +37,7 @@ Core ideas:
   - `orthogonalize(...)`: per $(k,\mu)$ bin Cholesky-based orthonormalization of fields.
   - `compute_corr_2d(...)`: computes $r_{ij}(k)$ matrices in each $\mu$-bin.  
   - `compute_pks_2d(...)`: measures auto power $P_i(k)$ for many fields across $\mu$-bins. 
-    -With `cross=True`, also computes cross-power spectra.
+    - With `cross=True`, also computes cross-power spectra.
 
 ---
 
