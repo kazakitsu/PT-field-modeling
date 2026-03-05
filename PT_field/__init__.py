@@ -1,6 +1,6 @@
 # utils/__init__.py
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 try:
     import jax.numpy
@@ -20,6 +20,9 @@ if use_jax:
         func_extend,
         func_reduce,
         func_reduce_hermite,
+        func_reduce_to_cube,
+        func_reduce_hermite_to_cube,
+        func_reduce_hermite_to_cube_fixed,
         low_pass_filter_fourier,
         high_pass_filter_fourier,
     )
@@ -55,6 +58,9 @@ __all__ = [
     "func_extend",
     "func_reduce",
     "func_reduce_hermite",
+    "func_reduce_to_cube",
+    "func_reduce_hermite_to_cube",
+    "func_reduce_hermite_to_cube_fixed",
     "low_pass_filter_fourier",
     "high_pass_filter_fourier",
     "Base_Forward",

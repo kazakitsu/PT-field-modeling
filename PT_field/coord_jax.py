@@ -261,6 +261,186 @@ def func_reduce_hermite(ng_red, array_3d):
     """Reduce then enforce Hermitian constraints."""
     return _enforce_hermite(func_reduce(ng_red, array_3d))
 
+# ---------- reduce to cube (keep original func_reduce untouched) ----------
+@partial(jit, static_argnames=("ng_red",))
+def func_reduce_to_cube(ng_red: int, array_3d: jnp.ndarray) -> jnp.ndarray:
+    """
+    Truncate high-k modes in rfftn layout and make a cubic grid in real space.
+
+    Input
+    -----
+    array_3d: rfftn(real_field) with shape (Nx, Ny, Nz//2 + 1), where the rfft axis is z.
+
+    Output
+    ------
+    rfftn layout for a cube real-space grid (ng_red, ng_red, ng_red):
+      shape (ng_red, ng_red, ng_red//2 + 1)
+
+    Requirements
+    ------------
+    - ng_red is even
+    - ng_red <= Nx, ng_red <= Ny, and ng_red <= Nz (real-space Nz)
+    """
+    nx, ny, nz_r = array_3d.shape
+    nz = (nz_r - 1) * 2  # assumes even real-space Nz
+
+    assert (ng_red % 2) == 0, "ng_red must be even."
+    assert ng_red <= nx and ng_red <= ny and ng_red <= nz, "ng_red must be <= Nx, Ny, Nz."
+
+    half = ng_red // 2
+
+    # x,y: full FFT ordering => keep [0..half-1] and [N-half..N-1]
+    idx_x = jnp.concatenate([jnp.arange(half), jnp.arange(nx - half, nx)])
+    idx_y = jnp.concatenate([jnp.arange(half), jnp.arange(ny - half, ny)])
+
+    # z: rFFT ordering => keep [0..half] (inclusive) => half+1 = ng_red//2+1
+    idx_z = jnp.arange(half + 1)
+
+    return array_3d[jnp.ix_(idx_x, idx_y, idx_z)]
+
+
+# ---------- enforce Hermitian for cube rfftn layout ----------
+@jit
+def _enforce_hermite_cube(array_k: jnp.ndarray) -> jnp.ndarray:
+    """
+    Enforce corner/axis Hermitian constraints for rfftn layout AFTER manual reduction.
+
+    Expects shape (ng, ng, ng//2+1) with even ng.
+    """
+    x = array_k
+    ng0, ng1, _ = x.shape
+    assert ng0 == ng1, "Expected square x/y for cube layout."
+    ng = ng0
+    assert (ng % 2) == 0, "Expected even ng."
+
+    half = ng // 2
+    lastz = x.shape[2] - 1  # kz = ng/2 plane
+
+    # Make four corners on z=0 and z=Nyq purely real
+    def realify_corners(zidx, arr):
+        ii = jnp.array([0, half, 0, half], dtype=jnp.int32)
+        jj = jnp.array([0, 0, half, half], dtype=jnp.int32)
+        kk = jnp.full_like(ii, zidx)
+        vals = jnp.real(arr[ii, jj, kk]).astype(arr.dtype)
+        return arr.at[ii, jj, kk].set(vals)
+
+    x = realify_corners(0, x)
+    x = realify_corners(lastz, x)
+
+    # Minimal 1D conjugate fixes along axes on z=0 and z=Nyq
+    y = jnp.arange(1, half, dtype=jnp.int32)  # 1..half-1
+
+    # y-axis line at x=0
+    x = x.at[0, -y, 0].set(jnp.conj(x[0, y, 0]))
+    x = x.at[0, -y, lastz].set(jnp.conj(x[0, y, lastz]))
+
+    # x-axis line at y=0
+    x = x.at[-y, 0, 0].set(jnp.conj(x[y, 0, 0]))
+    x = x.at[-y, 0, lastz].set(jnp.conj(x[y, 0, lastz]))
+
+    return x
+
+@partial(jit, static_argnames=("ng_red",))
+def func_reduce_hermite_to_cube(ng_red: int, array_3d: jnp.ndarray) -> jnp.ndarray:
+    """Reduce-to-cube then enforce Hermitian constraints."""
+    return _enforce_hermite_cube(func_reduce_to_cube(ng_red, array_3d))
+
+
+
+@jit
+def _hermitize_xy_plane(plane_xy: jnp.ndarray) -> jnp.ndarray:
+    """
+    Enforce 2D Hermitian symmetry on a single (x, y) Fourier plane:
+      P(-kx, -ky) = conj(P(kx, ky)) in FFT ordering.
+
+    This is required for kz=0 and kz=Nyquist planes in rfftn layout.
+    """
+    ng0, ng1 = plane_xy.shape
+    assert ng0 == ng1, "Expected a square plane."
+    ng = ng0
+    assert (ng % 2) == 0, "Expected even ng."
+
+    # Index mapping for k -> -k in FFT ordering
+    idx = jnp.arange(ng, dtype=jnp.int32)
+    idx_neg = (-idx) % ng
+
+    # P_neg(kx, ky) = P(-kx, -ky)
+    plane_neg = plane_xy[jnp.ix_(idx_neg, idx_neg)]
+
+    # Symmetrize: P <- (P + conj(P(-k))) / 2
+    plane_sym = 0.5 * (plane_xy + jnp.conj(plane_neg))
+
+    # Self conjugate points must be purely real: (0,0), (0,Nyq), (Nyq,0), (Nyq,Nyq)
+    half = ng // 2
+    ii = jnp.array([0, 0, half, half], dtype=jnp.int32)
+    jj = jnp.array([0, half, 0, half], dtype=jnp.int32)
+    vals = jnp.real(plane_sym[ii, jj]).astype(plane_sym.dtype)
+    plane_sym = plane_sym.at[ii, jj].set(vals)
+
+    return plane_sym
+
+
+@jit
+def _enforce_hermite_cube_fullplanes(array_k: jnp.ndarray) -> jnp.ndarray:
+    """
+    Enforce the necessary Hermitian constraints for rfftn layout on a cube:
+      - Apply full 2D Hermitian symmetrization on kz=0 and kz=Nyquist planes.
+
+    Expects shape (ng, ng, ng//2+1) with even ng.
+    """
+    x = array_k
+    ng0, ng1, nz_r = x.shape
+    assert ng0 == ng1, "Expected square x and y for cube layout."
+    ng = ng0
+    assert (ng % 2) == 0, "Expected even ng."
+    assert nz_r == (ng // 2 + 1), "Expected rfftn z axis to match cube."
+
+    # kz=0 plane
+    x = x.at[:, :, 0].set(_hermitize_xy_plane(x[:, :, 0]))
+
+    # kz=Nyquist plane in the reduced grid is the last stored plane
+    lastz = nz_r - 1
+    x = x.at[:, :, lastz].set(_hermitize_xy_plane(x[:, :, lastz]))
+
+    return x
+
+
+@jit
+def _drop_nyquist_planes_cube(array_k: jnp.ndarray) -> jnp.ndarray:
+    """
+    Optionally remove exact Nyquist modes to avoid checkerboard like patterns.
+    This corresponds to using a strict cutoff below Nyquist.
+    """
+    x = array_k
+    ng = x.shape[0]
+    half = ng // 2
+    lastz = x.shape[2] - 1
+
+    x = x.at[half, :, :].set(jnp.zeros_like(x[half, :, :]))   # kx = Nyquist
+    x = x.at[:, half, :].set(jnp.zeros_like(x[:, half, :]))   # ky = Nyquist
+    x = x.at[:, :, lastz].set(jnp.zeros_like(x[:, :, lastz])) # kz = Nyquist
+    return x
+
+
+@partial(jit, static_argnames=("ng_red", "drop_nyquist"))
+def func_reduce_hermite_to_cube_fixed(
+    ng_red: int,
+    array_3d: jnp.ndarray,
+    *,
+    drop_nyquist: bool = False,
+) -> jnp.ndarray:
+    """
+    Reduce rfftn spectrum to (ng_red, ng_red, ng_red//2+1) and enforce
+    full plane Hermitian constraints needed by irfftn.
+    """
+    x = func_reduce_to_cube(ng_red, array_3d)
+    x = _enforce_hermite_cube_fullplanes(x)
+    x = jnp.where(drop_nyquist, _drop_nyquist_planes_cube(x), x)
+    return x
+
+
+
+
 # ===========================
 # Sharp low/high-pass filters
 # ===========================

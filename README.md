@@ -26,16 +26,18 @@ Core ideas:
 
 - **LPT-based forward model (`LPT_Forward`)**
   - LPT displacement in real space, with optional **RSD**: $\psi_z \rightarrow \psi_z (1 + f)$.
-  - Scalar field builders up to **cubic** order: $1, \delta, \delta^2, {\mathcal{G}_2}, \delta^3, \delta{\mathcal{G}_2}, {\mathcal{G}_3}, {\Gamma_3}$
+  - Scalar field builders up to **cubic** order: $1, \delta_1, \delta_1^2, {\mathcal{G}_2}, \delta_1^3, \delta{\mathcal{G}_2}, {\mathcal{G}_3}, {\Gamma_3}$ and $S_3 = {\boldsymbol\psi_2}\cdot\nabla \delta_1$
     - With `rsd=True`, also builds ${\mathcal{G}^{\parallel}_{2}}$.  
     - With `lya=True`, also builds $\eta$-related helpers: $\eta^2$, $\delta\eta$, $KK^{\parallel}$.
+    - With `lya_full_fields=True`, also builds $\Pi^{[2]}^{\parallel}$ (and $\delta^3$).
   - Tensor field builders up to **quadratic** order: $K_{ij}, \delta K_{ij}, H_{ij}, T_{ij}$
     - `rsd` is not supported yet.
 
 - **Orthogonalization and diagnostics**
   - `orthogonalize(...)`: per $(k,\mu)$ bin Cholesky-based orthonormalization of fields.
   - `compute_corr_2d(...)`: computes $r_{ij}(k)$ matrices in each $\mu$-bin.  
-  - `compute_pks_2d(...)`: measures auto power $P_i(k)$ for many fields across $\mu$-bins.  
+  - `compute_pks_2d(...)`: measures auto power $P_i(k)$ for many fields across $\mu$-bins. 
+    -With `cross=True`, also computes cross-power spectra.
 
 ---
 

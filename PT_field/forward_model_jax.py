@@ -320,7 +320,7 @@ class Beta_Combine_Mixin:
     @partial(jit, static_argnames=('self', 'measure_pk'))
     def get_beta(
         self,
-        true_field_k: jnp.ndarray,     # (..., ng, ng, ng//2+1), complex
+        delta_g_k: jnp.ndarray,     # (..., ng, ng, ng//2+1), complex
         fields_k: jnp.ndarray,         # (n, ng, ng, ng//2+1), complex
         mu_edges: jnp.ndarray,         # (Nmu+1,)
         *,
@@ -352,7 +352,7 @@ class Beta_Combine_Mixin:
             # Compute P_auto_i(k) and P_cross_i(k) for all fields i
             def one_field(i):
                 # cross(true, field_i)
-                out_c  = measure_pk(true_field_k, fields_k[i], ell=0,
+                out_c  = measure_pk(delta_g_k, fields_k[i], ell=0,
                                     mu_min=mu_min, mu_max=mu_max)
                 Pci = out_c[:, 1].astype(dtype)                  # (Nk,)
 
@@ -369,7 +369,269 @@ class Beta_Combine_Mixin:
         beta0 = jnp.zeros((n_fields, Nk, Nmu), dtype=dtype)
         beta  = lax.fori_loop(0, Nmu, mu_body, beta0)
         return beta
-        
+    
+    @partial(jit, static_argnames=('self', 'measure_pk'))
+    def get_beta_lstsq(
+        self,
+        delta_g_k: jnp.ndarray,        # (..., ng, ng, ng//2+1), complex
+        fields_k: jnp.ndarray,         # (n, ng, ng, ng//2+1), complex
+        mu_edges: jnp.ndarray,         # (Nmu+1,)
+        *,
+        measure_pk,                    # Measure_Pk instance (static)
+        eps: float = 0.0,              # ridge term added to Gram diagonal per (k,mu)
+    ) -> jnp.ndarray:
+        """
+        Solve per-(k,mu) least squares:
+          min_beta sum_{modes in bin} |delta_g - sum_i beta_i O_i|^2
+
+        Normal equations per bin:
+          G_ij = <O_i O_j>_{bin}
+          b_i  = <delta_g O_i>_{bin}
+          beta = (G + eps * I)^{-1} b
+
+        Returns
+        -------
+        beta : (n_fields, Nk, Nmu)
+        Notes
+        -----
+        - Uses fori_loop over mu-bins to keep compile size moderate.
+        - Within each mu-bin:
+            * b is computed by lax.map over fields
+            * G is assembled with diagonal autos + upper-triangle crosses
+            * solve is vmap over k-bins
+        """
+        n_fields = int(fields_k.shape[0])
+        dtype = measure_pk.dtype
+        Nk = int(jnp.asarray(measure_pk.k_mean, dtype=dtype).shape[0])
+        Nmu = int(mu_edges.shape[0] - 1)
+
+        eye = jnp.eye(n_fields, dtype=dtype)
+        lam = jnp.asarray(eps, dtype=dtype)
+
+        def mu_body(m, beta_acc):
+            mu_min = mu_edges[m]
+            mu_max = mu_edges[m + 1]
+
+            # ---- b_i(k) = <delta_g O_i> for all i ----
+            def one_b(i):
+                out_c = measure_pk(
+                    delta_g_k, fields_k[i],
+                    ell=0, mu_min=mu_min, mu_max=mu_max
+                )
+                return out_c[:, 1].astype(dtype)  # (Nk,)
+
+            b_m = lax.map(one_b, jnp.arange(n_fields, dtype=jnp.int32))  # (n, Nk)
+
+            # ---- G_ij(k) = <O_i O_j> for all i,j ----
+            # Store as (n, n, Nk) for convenient scatter updates, then moveaxis to (Nk, n, n).
+            G_m = jnp.zeros((n_fields, n_fields, Nk), dtype=dtype)
+
+            # Diagonal autos
+            def one_auto(i):
+                out_a = measure_pk(
+                    fields_k[i],
+                    ell=0, mu_min=mu_min, mu_max=mu_max
+                )
+                return out_a[:, 1].astype(dtype)  # (Nk,)
+
+            auto_stack = lax.map(one_auto, jnp.arange(n_fields, dtype=jnp.int32))  # (n, Nk)
+            idx = jnp.arange(n_fields)
+            G_m = G_m.at[idx, idx, :].set(auto_stack)
+
+            # Upper triangle crosses (symmetric fill)
+            for j in range(1, n_fields):
+                def one_cross(i):
+                    out_x = measure_pk(
+                        fields_k[i], fields_k[j],
+                        ell=0, mu_min=mu_min, mu_max=mu_max
+                    )
+                    return out_x[:, 1].astype(dtype)  # (Nk,)
+
+                cross_stack = lax.map(one_cross, jnp.arange(j, dtype=jnp.int32))  # (j, Nk)
+                G_m = G_m.at[:j, j, :].set(cross_stack)
+                G_m = G_m.at[j, :j, :].set(cross_stack)
+
+            # ---- Solve per k: (G + lam I) beta = b ----
+            Gk = jnp.moveaxis(G_m, -1, 0)  # (Nk, n, n)
+            bk = jnp.swapaxes(b_m, 0, 1)   # (Nk, n)
+
+            Gk = Gk + lam * eye[None, :, :]
+
+            def solve_one(A, y):
+                return jnp.linalg.solve(A, y)
+
+            beta_k = vmap(solve_one, in_axes=(0, 0))(Gk, bk)  # (Nk, n)
+            beta_m = jnp.swapaxes(beta_k, 0, 1)              # (n, Nk)
+
+            return beta_acc.at[:, :, m].set(beta_m)
+
+        beta0 = jnp.zeros((n_fields, Nk, Nmu), dtype=dtype)
+        beta = lax.fori_loop(0, Nmu, mu_body, beta0)
+        return beta
+    
+    @partial(jit, static_argnames=('self', 'measure_pk'))
+    def _get_Rt_from_bases(
+        self,
+        fields_k: jnp.ndarray,          # (n, ng, ng, ng//2+1), complex
+        fields_ortho_k: jnp.ndarray,    # (n, ng, ng, ng//2+1), complex
+        mu_edges: jnp.ndarray,          # (Nmu+1,)
+        *,
+        measure_pk,                     # Measure_Pk instance (static)
+        eps: float = 0.0,               # ridge on G diagonal
+    ) -> jnp.ndarray:
+        """
+        Compute Rt(k,mu) = R(k,mu)^T from two bases O and O_ortho.
+
+        Definitions per (k,mu) bin:
+          G = <O O^T>
+          H = <O_ortho O^T>
+          H = R G  ->  R^T = (G^T)^{-1} H^T
+
+        Returns
+        -------
+        Tt : (Nk, Nmu, n, n)
+        """
+        n_fields = int(fields_k.shape[0])
+        dtype = measure_pk.dtype
+        Nk = int(jnp.asarray(measure_pk.k_mean, dtype=dtype).shape[0])
+        Nmu = int(mu_edges.shape[0] - 1)
+
+        eye = jnp.eye(n_fields, dtype=dtype)
+        lam = jnp.asarray(eps, dtype=dtype)
+
+        def mu_body(m, Tt_acc):
+            mu_min = mu_edges[m]
+            mu_max = mu_edges[m + 1]
+
+            # ---- G_ij(k) = <O_i O_j> ----
+            # Store as (n, n, Nk) then moveaxis to (Nk, n, n)
+            G_m = jnp.zeros((n_fields, n_fields, Nk), dtype=dtype)
+
+            def one_auto(i):
+                out_a = measure_pk(
+                    fields_k[i], None,
+                    ell=0, mu_min=mu_min, mu_max=mu_max
+                )
+                return out_a[:, 1].astype(dtype)  # (Nk,)
+
+            auto_stack = lax.map(one_auto, jnp.arange(n_fields, dtype=jnp.int32))  # (n, Nk)
+            idx = jnp.arange(n_fields)
+            G_m = G_m.at[idx, idx, :].set(auto_stack)
+
+            for j in range(1, n_fields):
+                def one_cross(i):
+                    out_x = measure_pk(
+                        fields_k[i], fields_k[j],
+                        ell=0, mu_min=mu_min, mu_max=mu_max
+                    )
+                    return out_x[:, 1].astype(dtype)  # (Nk,)
+
+                cross_stack = lax.map(one_cross, jnp.arange(j, dtype=jnp.int32))  # (j, Nk)
+                G_m = G_m.at[:j, j, :].set(cross_stack)
+                G_m = G_m.at[j, :j, :].set(cross_stack)
+
+            # ---- H_ij(k) = <O_ortho_i O_j> ----
+            H_m = jnp.zeros((n_fields, n_fields, Nk), dtype=dtype)
+
+            for j in range(n_fields):
+                def one_col(i):
+                    out_h = measure_pk(
+                        fields_ortho_k[i], fields_k[j],
+                        ell=0, mu_min=mu_min, mu_max=mu_max
+                    )
+                    return out_h[:, 1].astype(dtype)  # (Nk,)
+
+                col_stack = lax.map(one_col, jnp.arange(n_fields, dtype=jnp.int32))  # (n, Nk)
+                H_m = H_m.at[:, j, :].set(col_stack)
+
+            # ---- Tt(k) = solve(G(k)^T + lam I, H(k)^T) for each k ----
+            Gk = jnp.moveaxis(G_m, -1, 0)  # (Nk, n, n)
+            Hk = jnp.moveaxis(H_m, -1, 0)  # (Nk, n, n)
+
+            A = jnp.swapaxes(Gk, -1, -2) + lam * eye[None, :, :]  # (Nk, n, n)
+            B = jnp.swapaxes(Hk, -1, -2)                          # (Nk, n, n)
+
+            def solve_mat(Ak, Bk):
+                return jnp.linalg.solve(Ak, Bk)  # (n, n)
+
+            Rt_k = vmap(solve_mat, in_axes=(0, 0))(A, B)  # (Nk, n, n)
+
+            return Tt_acc.at[:, m, :, :].set(Rt_k)
+
+        Rt0 = jnp.zeros((Nk, Nmu, n_fields, n_fields), dtype=dtype)
+        Rt = lax.fori_loop(0, Nmu, mu_body, Rt0)
+        return Rt
+
+    @partial(jit, static_argnames=('self', 'measure_pk'))
+    def beta_from_beta_ortho(
+        self,
+        beta_ortho: jnp.ndarray,        # (n, Nk, Nmu)
+        fields_k: jnp.ndarray,          # (n, ng, ng, ng//2+1)
+        fields_ortho_k: jnp.ndarray,    # (n, ng, ng, ng//2+1)
+        mu_edges: jnp.ndarray,          # (Nmu+1,)
+        *,
+        measure_pk,
+        eps: float = 0.0,
+    ) -> jnp.ndarray:
+        """
+        Convert beta_ortho -> beta using both bases.
+
+          beta = R^T beta_ortho
+          R^T = solve(G^T, H^T),  G=<O O^T>, H=<O_ortho O^T>
+        """
+        Rt = self._get_Rt_from_bases(
+            fields_k=fields_k,
+            fields_ortho_k=fields_ortho_k,
+            mu_edges=mu_edges,
+            measure_pk=measure_pk,
+            eps=eps,
+        )  # (Nk, Nmu, n, n)
+
+        # beta(i,k,mu) = sum_j Tt(k,mu,i,j) * beta_ortho(j,k,mu)
+        beta = jnp.einsum("kmij,jkm->ikm", Rt, beta_ortho)
+        return beta
+
+    @partial(jit, static_argnames=('self', 'measure_pk'))
+    def beta_ortho_from_beta(
+        self,
+        beta: jnp.ndarray,              # (n, Nk, Nmu)
+        fields_k: jnp.ndarray,          # (n, ng, ng, ng//2+1)
+        fields_ortho_k: jnp.ndarray,    # (n, ng, ng, ng//2+1)
+        mu_edges: jnp.ndarray,          # (Nmu+1,)
+        *,
+        measure_pk,
+        eps: float = 0.0,
+    ) -> jnp.ndarray:
+        """
+        Convert beta -> beta_ortho using both bases.
+
+          beta = R^T beta_ortho  ->  beta_ortho = solve(R^T, beta)
+          R^T = solve(G^T, H^T),  G=<O O^T>, H=<O_ortho O^T>
+        """
+        Rt = self._get_Rt_from_bases(
+            fields_k=fields_k,
+            fields_ortho_k=fields_ortho_k,
+            mu_edges=mu_edges,
+            measure_pk=measure_pk,
+            eps=eps,
+        )  # (Nk, Nmu, n, n)
+
+        n = int(beta.shape[0])
+        Nk = int(beta.shape[1])
+        Nmu = int(beta.shape[2])
+
+        Rtf = Rt.reshape(Nk * Nmu, n, n)
+        bf  = jnp.moveaxis(beta, 0, -1).reshape(Nk * Nmu, n)  # (Nk*Nmu, n)
+
+        def solve_vec(A, y):
+            return jnp.linalg.solve(A, y)  # (n,)
+
+        x_f = vmap(solve_vec, in_axes=(0, 0))(Rtf, bf)  # (Nk*Nmu, n)
+        x = x_f.reshape(Nk, Nmu, n)                     # (Nk, Nmu, n)
+        beta_ortho = jnp.moveaxis(x, -1, 0)             # (n, Nk, Nmu)
+        return beta_ortho
+
+
     def _ensure_nearest_cache(self, k_edges: jnp.ndarray, mu_edges: jnp.ndarray):
         r"""
         Build (and cache) a nearest-neighbor interpolation map from grid points to (k, mu) bins.
@@ -716,6 +978,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
         mas_cfg: Tuple[int, bool],
         rsd: bool = False,
         lya: bool = False,
+        lya_full_fields: bool = False,
         lpt_order: int = 1,
         bias_order: int = 2,
         renormalize: bool = True,
@@ -741,6 +1004,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
 
         self.rsd = bool(rsd)
         self.lya = bool(lya)
+        self.lya_full_fields = bool(lya_full_fields)
         self.lpt_order = int(lpt_order)
         self.bias_order = int(bias_order)
         self.renormalize = bool(renormalize)
@@ -897,8 +1161,8 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
         return disp_r_L  # (3, ng, ng, ng)
 
     # -------- scalar fields in position space -------
-    @partial(jit, static_argnames=('self', 'full_fields'))
-    def _scalar_fields_r(self, delta_k: jnp.ndarray, full_fields=False) -> jnp.ndarray:
+    @partial(jit, static_argnames=('self'))
+    def _scalar_fields_r(self, delta_k: jnp.ndarray) -> jnp.ndarray:
         r"""
         Build scalar fields in position space: [1, delta, d^2, G2, (G2_zz), (LyA extras...)]
         Returns stacked array with leading field axis.
@@ -949,10 +1213,10 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
 
             # Ly-A extras
             if self.lya:
-                if full_fields:
-                    eta_k_L = self.pad_fields_L(Gij_k[5][None,...])[0] # equals delta * mu^2 in k space (Gzz)
-                    eta_r_L = self.irfftn(eta_k_L)
-                    eta_r_L = eta_r_L - jnp.mean(eta_r_L)
+                #if self.lya_full_fields:
+                #    eta_k_L = self.pad_fields_L(Gij_k[5][None,...])[0] # equals delta * mu^2 in k space (Gzz)
+                #    eta_r_L = self.irfftn(eta_k_L)
+                #    eta_r_L = eta_r_L - jnp.mean(eta_r_L)
 
                 eta2_r_pad = Gij_r_pad[5]**2
                 eta2_k_pad = self.rfftn(eta2_r_pad)
@@ -978,11 +1242,19 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
                 KK_zz_r_L = GG_zz_r_L - (2./3.) * deta_r_L + (1./9.) * d2_r_L
                 KK_zz_r_L = KK_zz_r_L - jnp.mean(KK_zz_r_L)
 
-                if full_fields:
+                if self.lya_full_fields:
                     ### degenerate operators
                     pi_zz_r_L = GG_zz_r_L - 5./7 * G2_zz_r_L
+                    ### for a moment 
+                    d3_r_pad = delta_r_pad**3
+                    d3_k_pad = self.rfftn(d3_r_pad)
+                    d3_k     = self.unpad_fields(d3_k_pad[None,...])[0]
+                    d3_k_L   = self.pad_fields_L(d3_k[None,...])[0]
+                    d3_r_L   = self.irfftn(d3_k_L)
+                    d3_r_L   = d3_r_L - jnp.mean(d3_r_L)
                     fields.extend([eta2_r_L, deta_r_L, KK_zz_r_L, 
-                                   eta_r_L, pi_zz_r_L])
+                                   pi_zz_r_L,
+                                   d3_r_L,])
                 else:
                     fields.extend([eta2_r_L, deta_r_L, KK_zz_r_L])
 
@@ -1086,85 +1358,112 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
     def _tensor_fields_r(self, delta_k: jnp.ndarray) -> jnp.ndarray:
         r"""
         Build tensor fields in position space: [K_ij, dK_ij, H_ij, T_ij, ...]
-        ### to be modified as in the scalar case.
         Returns
         -------
         (n_fields, 6, ng, ng, ng) with order (xx,xy,xz,yy,yz,zz) in the 6-axis.
         """
         delta_k = delta_k.at[0,0,0].set(0.0).astype(self.complex_dtype)  # Ensure delta_k[0] = 0.0
         
-        K_ij_k = coord.apply_Gij_k(delta_k, self.kx_L, self.ky_L, self.kz_L)  # (6, ng_L, ng_L, ng_L//2+1)
-        K_ij_k = coord.apply_traceless(K_ij_k)
-
         fields = []
 
         if self.bias_order >= 1:
-            K_ij_r = self._irfftn_vec(K_ij_k)  # (6, ng_L, ng_L, ng_L)
+            delta_k_L = self.pad_fields_L(delta_k[None,...])[0]
+            Pi1_ij_k = coord.apply_Gij_k(delta_k_L, self.kx_L, self.ky_L, self.kz_L)  # (6, ng_L, ng_L, ng_L//2+1)
+            Pi1_ij_r = self._irfftn_vec(Pi1_ij_k)  # (6, ng_L, ng_L, ng_L)
+            K_ij_r = coord.apply_traceless(Pi1_ij_r)
             fields.append(K_ij_r)
 
         if self.bias_order >= 2:
-            delta_r = self.irfftn(delta_k)
+            delta_k_pad = coord.func_extend(self.ng_pad, delta_k)
+            delta_r_pad = self.irfftn(delta_k_pad)
 
-            dK_ij_r = K_ij_r * delta_r[None, :, :, :]  # (6, ng_L, ng_L, ng_L)
-            dK_ij_r = dK_ij_r - jnp.mean(dK_ij_r, axis=(1, 2, 3), keepdims=True)
+            Pi1_ij_k = coord.apply_Gij_k(delta_k, self.kx, self.ky, self.kz)  # (6, ng, ng, ng//2+1)
+            Pi1_ij_k_pad = self.pad_fields(Pi1_ij_k)  # (6, ng_pad, ng_pad, ng_pad//2+1)
+            Pi1_ij_r_pad = self._irfftn_vec(Pi1_ij_k_pad)  # (6, ng_pad, ng_pad, ng_pad)
 
-            #G_ij_r = self._irfftn_vec(G_ij_k)  # (6, ng_L, ng_L, ng_L)
+            dPi1_ij_r_pad = Pi1_ij_r_pad * delta_r_pad[None, :, :, :]
+            dPi1_ij_k_pad = self._rfftn_vec(dPi1_ij_r_pad)
+            dPi1_ij_k = self.unpad_fields(dPi1_ij_k_pad)
+            dPi1_ij_k_L = self.pad_fields_L(dPi1_ij_k)
+            dPi1_ij_r = self._irfftn_vec(dPi1_ij_k_L)
+            dPi1_ij_r = dPi1_ij_r - jnp.mean(dPi1_ij_r, axis=(1, 2, 3), keepdims=True)
 
-            #KK_xx_r = G_ij_r[0]*G_ij_r[0] + G_ij_r[1]*G_ij_r[1] + G_ij_r[2]*G_ij_r[2]
-            #KK_xy_r = G_ij_r[0]*G_ij_r[1] + G_ij_r[1]*G_ij_r[3] + G_ij_r[2]*G_ij_r[4]
-            #KK_xz_r = G_ij_r[0]*G_ij_r[2] + G_ij_r[1]*G_ij_r[4] + G_ij_r[2]*G_ij_r[5]
-            #KK_yy_r = G_ij_r[3]*G_ij_r[3] + G_ij_r[1]*G_ij_r[1] + G_ij_r[4]*G_ij_r[4]
-            #KK_yz_r = G_ij_r[3]*G_ij_r[4] + G_ij_r[1]*G_ij_r[2] + G_ij_r[4]*G_ij_r[5]
-            #KK_zz_r = G_ij_r[5]*G_ij_r[5] + G_ij_r[2]*G_ij_r[2] + G_ij_r[4]*G_ij_r[4]
+            Pi1_sqrt_xx_r_pad = Pi1_ij_r_pad[0]*Pi1_ij_r_pad[0] + Pi1_ij_r_pad[1]*Pi1_ij_r_pad[1] + Pi1_ij_r_pad[2]*Pi1_ij_r_pad[2]
+            Pi1_sqrt_xy_r_pad = Pi1_ij_r_pad[0]*Pi1_ij_r_pad[1] + Pi1_ij_r_pad[1]*Pi1_ij_r_pad[3] + Pi1_ij_r_pad[2]*Pi1_ij_r_pad[4]
+            Pi1_sqrt_xz_r_pad = Pi1_ij_r_pad[0]*Pi1_ij_r_pad[2] + Pi1_ij_r_pad[1]*Pi1_ij_r_pad[4] + Pi1_ij_r_pad[2]*Pi1_ij_r_pad[5]
+            Pi1_sqrt_yy_r_pad = Pi1_ij_r_pad[3]*Pi1_ij_r_pad[3] + Pi1_ij_r_pad[1]*Pi1_ij_r_pad[1] + Pi1_ij_r_pad[4]*Pi1_ij_r_pad[4]
+            Pi1_sqrt_yz_r_pad = Pi1_ij_r_pad[3]*Pi1_ij_r_pad[4] + Pi1_ij_r_pad[1]*Pi1_ij_r_pad[2] + Pi1_ij_r_pad[4]*Pi1_ij_r_pad[5]
+            Pi1_sqrt_zz_r_pad = Pi1_ij_r_pad[5]*Pi1_ij_r_pad[5] + Pi1_ij_r_pad[2]*Pi1_ij_r_pad[2] + Pi1_ij_r_pad[4]*Pi1_ij_r_pad[4]
 
-            KK_xx_r = K_ij_r[0]*K_ij_r[0] + K_ij_r[1]*K_ij_r[1] + K_ij_r[2]*K_ij_r[2]
-            KK_xy_r = K_ij_r[0]*K_ij_r[1] + K_ij_r[1]*K_ij_r[3] + K_ij_r[2]*K_ij_r[4]
-            KK_xz_r = K_ij_r[0]*K_ij_r[2] + K_ij_r[1]*K_ij_r[4] + K_ij_r[2]*K_ij_r[5]
-            KK_yy_r = K_ij_r[3]*K_ij_r[3] + K_ij_r[1]*K_ij_r[1] + K_ij_r[4]*K_ij_r[4]
-            KK_yz_r = K_ij_r[3]*K_ij_r[4] + K_ij_r[1]*K_ij_r[2] + K_ij_r[4]*K_ij_r[5]
-            KK_zz_r = K_ij_r[5]*K_ij_r[5] + K_ij_r[2]*K_ij_r[2] + K_ij_r[4]*K_ij_r[4]
-
-            K2_r = K_ij_r[0]**2 + K_ij_r[3]**2 + K_ij_r[5]**2 + 2.0*(K_ij_r[1]**2 + K_ij_r[2]**2 + K_ij_r[4]**2)
-            K2_over_3 = (K2_r / 3.0).astype(self.real_dtype)
+            Pi1_sqrt_r_pad = jnp.stack([Pi1_sqrt_xx_r_pad,
+                                        Pi1_sqrt_xy_r_pad,
+                                        Pi1_sqrt_xz_r_pad,
+                                        Pi1_sqrt_yy_r_pad,
+                                        Pi1_sqrt_yz_r_pad,
+                                        Pi1_sqrt_zz_r_pad])
             
-            ### Traceless
-            KK_xx_r = KK_xx_r - K2_over_3
-            KK_yy_r = KK_yy_r - K2_over_3
-            KK_zz_r = KK_zz_r - K2_over_3
-            
-            KK_ij_r = jnp.stack([KK_xx_r, KK_xy_r, KK_xz_r, KK_yy_r, KK_yz_r, KK_zz_r], axis=0)
-            KK_ij_r = KK_ij_r - jnp.mean(KK_ij_r, axis=(1, 2, 3), keepdims=True)
-            H_ij_r = KK_ij_r - (1./3.)*dK_ij_r
+            H_ij_r_pad = Pi1_sqrt_r_pad - dPi1_ij_r_pad
+            H_ij_k_pad = self._irfftn_vec(H_ij_r_pad)
+            H_ij_k     = self.unpad_fields(H_ij_k_pad)
+            H_ij_k_L   = self.pad_fields_L(H_ij_k)
+            H_ij_r_L   = self._rfftn_vec(H_ij_k_L)
+            H_ij_r_L   = coord.apply_traceless(H_ij_r_L)
+            H_ij_r_L   = H_ij_r_L - jnp.mean(H_ij_r_L, axis=(1, 2, 3), keepdims=True)
 
-            T_r = (delta_r*delta_r - 1.5 * K2_r).astype(self.real_dtype)
-            T_ij_k = coord.apply_Gij_k(self.rfftn(T_r), self.kx_L, self.ky_L, self.kz_L)  # (6, nx, ny, nzr)
-            T_ij_k = coord.apply_traceless(T_ij_k)
-            T_ij_r = self._irfftn_vec(T_ij_k)  # (6, ng_L, ng_L, ng_L)
-            T_ij_r = T_ij_r - jnp.mean(T_ij_r, axis=(1, 2, 3), keepdims=True)
+            dPi1_ij_k   = self.unpad_fields(dPi1_ij_k_pad)
+            dPi1_ij_k_L = self.pad_fields_L(dPi1_ij_k)
+            dPi1_ij_r_L = self._irfftn_vec(dPi1_ij_k_L)
+            dPi1_ij_r_L = coord.apply_traceless(dPi1_ij_r_L)
+            dPi1_ij_r_L = dPi1_ij_r - jnp.mean(dPi1_ij_r, axis=(1, 2, 3), keepdims=True)
 
-            fields.extend([dK_ij_r, H_ij_r, T_ij_r])
+            G2_r_pad    = -2.0 * (Pi1_sqrt_xx_r_pad + Pi1_sqrt_yy_r_pad + Pi1_sqrt_zz_r_pad)
+            G2_k_pad    = self.irfftn(G2_r_pad)
+            G2_k        = self.unpad_fields(G2_k_pad)
+            G2_k_L      = self.pad_fields_L(G2_k)
+            T_ij_k_L    = -3./2.*coord.apply_Gij_k(G2_k_L, self.kx_L, self.ky_L, self.kz_L)
+            T_ij_r_L    = self._irfftn_vec(T_ij_k_L)
+            T_ij_r_L    = coord.apply_traceless(T_ij_r_L)
+            T_ij_r_L    = T_ij_r_L - jnp.mean(T_ij_r_L, axis=(1, 2, 3), keepdims=True)
+
+            fields.extend([dPi1_ij_r_L, H_ij_r_L, T_ij_r_L])
 
         if self.bias_order >= 3:
             ValueError("Third-order tensor fields not implemented yet.")
 
         return jnp.array(fields)
     
-    @staticmethod
-    @partial(jit, donate_argnums=(0,))
-    def to_lya_fields(fields_r: jnp.ndarray, growth_f: float) -> jnp.ndarray:
+    @partial(jit, donate_argnums=(1,), static_argnames=('self',))
+    def to_lya_fields(self, fields: jnp.ndarray, growth_f: float) -> jnp.ndarray:
         """
         Rewrite fields along axis=0 for LyA combination.
         The input buffer is donated to reduce peak memory if possible.
         """
-        orig = fields_r
+        orig = fields
 
         fac = 3./7. * growth_f
 
-        out = (orig
-               .at[0].set(orig[1])                      # new[0] = shifted_d
-               .at[1].set(orig[0] - fac * orig[4])      # new[1] = shifted_1 - fac * G2_zz
-               .at[4:7].set(orig[5:8])                  # new[4:7] = shifted_deta, shifted_eta2, shifted_KK_zz
-               )
+        if self.lya_full_fields:
+            out = (orig
+                   .at[0].set(orig[1])                  # new[0] = shifted_d,
+                   .at[1].set(orig[0] - fac * orig[4])  # new[1] = shifted_eta_new = shifted_1 - fac * shifted_G2_zz
+                   .at[2].set(orig[2])                  # new[2] = shifted_d2
+                   .at[3].set(orig[9])                  # new[3] = shifted_d3
+                   .at[4].set(orig[3])                  # new[4] = shifted_G2
+                   .at[5].set(orig[6])                  # new[5] = shifted_deta
+                   .at[6].set(orig[5])                  # new[6] = shifted_eta2
+                   .at[7].set(orig[7])                  # new[7] = shifted_KK_zz
+                   .at[8].set(orig[8])                  # new[8] = shifted_pi_zz          
+                )
+        else:
+            out = (orig
+                   .at[0].set(orig[1])                  # new[0] = shifted_d,
+                   .at[1].set(orig[0] - fac * orig[4])  # new[1] = shifted_eta_new = shifted_1 - fac * shifted_G2_zz
+                   .at[2].set(orig[2])                  # new[2] = shifted_d2
+                   .at[3].set(orig[3])                  # new[3] = shifted_G2
+                   .at[4].set(orig[6])                  # new[4] = shifted_deta
+                   .at[5].set(orig[5])                  # new[5] = shifted_eta2
+                   .at[6].set(orig[7])                  # new[6] = shifted_KK_zz
+                   )
         return out
     
     # -------- linear & quadratic helper fields (API preserved) --------
@@ -2078,6 +2377,108 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
 
         return final_k.astype(self.complex_dtype)
     
+    def get_noise_field(
+        self,
+        white_noise_k: jnp.ndarray,
+        *,
+        k_edges: jnp.ndarray,                 # (Nk+1,)
+        mu_edges: jnp.ndarray,                # (Nmu+1,)
+        noise_kmu_mid: jnp.ndarray,           # (Nk, Nmu)
+        observer_pos: Optional[jnp.ndarray] = None,   # (3,), used only if chi_range is not None
+        chi_range: Optional[tuple] = None,    # (chi_low, chi_high), optional shell mask
+        nearest_idx: Optional[jnp.ndarray] = None,    # optional cache for rfft grid lookup
+        r2_grid: Optional[jnp.ndarray] = None,        # optional cache for Eulerian radius^2
+        dtype=jnp.float32,
+    ) -> jnp.ndarray:
+        """
+        Build a Gaussian noise field in k-space for a single snapshot from a white-noise GRF,
+        matching a target Perr(k, mu) table on the rfft grid.
+
+        If chi_range=(chi_low, chi_high) is provided, the field is transformed to real space,
+        masked in the Eulerian shell [chi_low, chi_high), then transformed back to k-space.
+        This optional path is used by get_noise_lightcone().
+
+        Returns
+        -------
+        noise_k : (ng_E, ng_E, ng_E//2+1), complex
+            Noise field in k-space (rfftn convention).
+        """
+        # --- basic setup ---
+        white_noise_k = jnp.asarray(white_noise_k, dtype=self.complex_dtype)
+        white_noise_k = white_noise_k.at[0, 0, 0].set(0.0)  # force DC=0
+
+        ng_E = int(self.ng_E)
+        inv2V = jnp.array(0.5 / self.vol, dtype=self.real_dtype)
+
+        k_edges = jnp.asarray(k_edges, dtype=self.real_dtype)
+        mu_edges = jnp.asarray(mu_edges, dtype=self.real_dtype)
+
+        Nk = int(k_edges.shape[0] - 1)
+        Nmu = int(mu_edges.shape[0] - 1)
+
+        noise_kmu_mid = jnp.asarray(noise_kmu_mid, dtype=self.real_dtype)
+        if noise_kmu_mid.shape != (Nk, Nmu):
+            raise ValueError(f"noise_kmu_mid must have shape (Nk, Nmu) = {(Nk, Nmu)}")
+
+        # --- build (or reuse) bin-containment lookup on the rfft grid ---
+        if nearest_idx is None:
+            nearest_idx, Nk_chk, Nmu_chk = utils_jax._build_nearest_idx_for_grid(
+                ng_E, self.boxsize, k_edges, mu_edges, dtype=self.real_dtype
+            )
+            if (Nk_chk != Nk) or (Nmu_chk != Nmu):
+                raise RuntimeError(
+                    f"Internal bin mismatch: edges imply (Nk,Nmu)=({Nk},{Nmu}) "
+                    f"but lookup returned ({Nk_chk},{Nmu_chk})."
+                )
+        else:
+            nearest_idx = jnp.asarray(nearest_idx)
+
+        # --- expand Perr(k,mu) to the full rfft grid ---
+        Perr_grid = jnp.take(noise_kmu_mid.reshape(Nk * Nmu), nearest_idx, axis=0)
+        Perr_grid = Perr_grid.at[0, 0, 0].set(0.0)  # ensure DC=0
+
+        # --- scale white noise in k-space ---
+        amp = jnp.sqrt(jnp.maximum(Perr_grid, 0.0) * inv2V).astype(self.real_dtype)
+        noise_k = (amp * white_noise_k).astype(self.complex_dtype)
+        noise_k = noise_k.at[0, 0, 0].set(0.0)
+
+        # --- snapshot case: no shell mask ---
+        if chi_range is None:
+            return noise_k.astype(self.complex_dtype)
+
+        # --- light-cone slice case: apply Eulerian shell mask in real space ---
+        chi_low, chi_high = chi_range
+        chi_low = jnp.asarray(chi_low, dtype=self.real_dtype)
+        chi_high = jnp.asarray(chi_high, dtype=self.real_dtype)
+
+        if r2_grid is None:
+            if observer_pos is None:
+                observer_pos = jnp.array([0.0, 0.0, 0.0], dtype=self.real_dtype)
+            else:
+                observer_pos = jnp.asarray(observer_pos, dtype=self.real_dtype)
+
+            dx = self.boxsize / ng_E
+            x1d = (jnp.arange(ng_E, dtype=self.real_dtype)) * dx
+            x_rel = (x1d - observer_pos[0])[:, None, None]
+            y_rel = (x1d - observer_pos[1])[None, :, None]
+            z_rel = (x1d - observer_pos[2])[None, None, :]
+            r2_grid = x_rel * x_rel + y_rel * y_rel + z_rel * z_rel
+        else:
+            r2_grid = jnp.asarray(r2_grid, dtype=self.real_dtype)
+
+        noise_r = jnp.fft.irfftn(noise_k, s=(ng_E, ng_E, ng_E), norm="ortho").astype(self.real_dtype)
+
+        chi2_low = chi_low * chi_low
+        chi2_high = chi_high * chi_high
+        in_shell = (r2_grid >= chi2_low) & (r2_grid < chi2_high)
+
+        noise_r_masked = jnp.where(in_shell, noise_r, 0.0).astype(self.real_dtype)
+        noise_k_masked = jnp.fft.rfftn(noise_r_masked, norm="ortho").astype(self.complex_dtype)
+        noise_k_masked = noise_k_masked.at[0, 0, 0].set(0.0)
+
+        return noise_k_masked.astype(self.complex_dtype)
+
+
     def get_noise_lightcone(
         self,
         white_noise_k: jnp.ndarray,
@@ -2093,18 +2494,9 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
         dtype=jnp.float32,
     ) -> jnp.ndarray:
         """
-        Build a light-cone noise field by:
-          (1) scaling a white-noise GRF in k-space to match Perr(k, mu) for each z-slice
-              using bin-containment lookup over (k, mu) with utils_jax._build_nearest_idx_for_grid,
-          (2) transforming to real space, masking cells outside the [chi_s, chi_{s+1}) shell
-              (Eulerian selection; no displacement),
-          (3) transforming back to k-space and accumulating across slices.
+        Build a light-cone noise field by summing shell-masked snapshot noise fields.
 
-        Notes
-        -----
-        - (k, mu) binning is now CONSISTENT with orthogonalize(): k-bin by k^2 within edges,
-          mu-bin by mu^2 within edges (no midpoint-nearest).
-        - mu is effectively |kz|/|k| since we use kz^2/k^2 (range [0,1]).
+        Internally, this calls get_noise_field(...) for each chi-slice with a shell mask.
         """
         # --- sanity checks ---
         if k_edges is None or mu_edges is None:
@@ -2112,23 +2504,24 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
         if noise_kmu_mid is None:
             raise ValueError("noise_kmu_mid is required.")
 
+        # NOTE:
+        # rsd_axis and measure_pk are kept for API compatibility.
+        # The current (k, mu) lookup helper is assumed to use the default LOS convention
+        # used elsewhere in your code (effectively z-axis for mu = |kz|/|k|).
+
         white_noise_k = jnp.asarray(white_noise_k, dtype=self.complex_dtype)
         white_noise_k = white_noise_k.at[0, 0, 0].set(0.0)  # force DC=0
 
-        # Ensure volume is ready
-        inv2V = jnp.array(0.5 / self.vol, dtype=self.real_dtype)
-
-        # --- bin-containment index on the rfft grid (built once, reused across slices) ---
-        # Use ng_E because white_noise_k is assumed to live on the Eulerian grid.
         ng_E = int(self.ng_E)
         k_edges = jnp.asarray(k_edges, dtype=self.real_dtype)
         mu_edges = jnp.asarray(mu_edges, dtype=self.real_dtype)
 
+        # --- build and cache rfft-grid lookup once ---
         nearest_idx, Nk, Nmu = utils_jax._build_nearest_idx_for_grid(
             ng_E, self.boxsize, k_edges, mu_edges, dtype=self.real_dtype
         )
 
-        # --- observer location and Eulerian coordinates (cell centers) ---
+        # --- observer position and Eulerian radius^2 grid (cached once) ---
         if observer_pos is None:
             observer_pos = jnp.array([0.0, 0.0, 0.0], dtype=self.real_dtype)
         else:
@@ -2141,10 +2534,7 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
         z_rel = (x1d - observer_pos[2])[None, None, :]
         r2_grid = x_rel * x_rel + y_rel * y_rel + z_rel * z_rel  # (ng_E, ng_E, ng_E)
 
-        # --- accumulator in k-space ---
-        final_k = jnp.zeros_like(white_noise_k, dtype=self.complex_dtype)
-
-        # --- main loop over slices ---
+        # --- validate inputs ---
         chi_edges = jnp.asarray(chi_edges, dtype=self.real_dtype)
         Ns = int(chi_edges.shape[0] - 1)
 
@@ -2152,34 +2542,26 @@ class LPT_Forward(Base_Forward, Beta_Combine_Mixin):
         if noise_kmu_mid.shape[:3] != (Ns, Nk, Nmu):
             raise ValueError(f"noise_kmu_mid must have shape (Ns, Nk, Nmu) = {(Ns, Nk, Nmu)}")
 
+        # --- accumulate shell-masked k-space fields ---
+        final_k = jnp.zeros_like(white_noise_k, dtype=self.complex_dtype)
+
         for s in range(Ns):
-            # --- target Perr table for this slice ---
-            Perr_table = noise_kmu_mid[s]  # (Nk, Nmu)
+            slice_k = self.get_noise_field(
+                white_noise_k,
+                k_edges=k_edges,
+                mu_edges=mu_edges,
+                noise_kmu_mid=noise_kmu_mid[s],     # (Nk, Nmu)
+                observer_pos=observer_pos,
+                chi_range=(chi_edges[s], chi_edges[s + 1]),
+                nearest_idx=nearest_idx,            # reuse cached lookup
+                r2_grid=r2_grid,                    # reuse cached radius grid
+                dtype=dtype,
+            )
+            final_k = final_k + slice_k
 
-            # --- expand Perr(k,mu) table onto the rfft grid via nearest_idx ---
-            Perr_grid = jnp.take(Perr_table.reshape(Nk * Nmu), nearest_idx, axis=0)
-            Perr_grid = Perr_grid.at[0, 0, 0].set(0.0)  # ensure DC=0
-
-            # --- scale white noise in k-space to match Perr(k,mu) ---
-            amp = jnp.sqrt(jnp.maximum(Perr_grid, 0.0) * inv2V).astype(self.real_dtype)
-            slice_k = (amp * white_noise_k).astype(self.complex_dtype)
-
-            # --- go to real space, apply Eulerian shell mask, and go back to k-space ---
-            slice_r = jnp.fft.irfftn(slice_k, s=(ng_E, ng_E, ng_E), norm="ortho").astype(self.real_dtype)
-
-            chi2_low = chi_edges[s] ** 2
-            chi2_high = chi_edges[s + 1] ** 2
-            in_shell = (r2_grid >= chi2_low) & (r2_grid < chi2_high)
-
-            slice_r_masked = jnp.where(in_shell, slice_r, 0.0).astype(self.real_dtype)
-
-            slice_k_masked = jnp.fft.rfftn(slice_r_masked, norm="ortho").astype(self.complex_dtype)
-            slice_k_masked = slice_k_masked.at[0, 0, 0].set(0.0)
-
-            # --- accumulate ---
-            final_k = final_k + slice_k_masked
-
+        final_k = final_k.at[0, 0, 0].set(0.0)
         return final_k.astype(self.complex_dtype)
+
 
 
 # ------------------------------ EPT ------------------------------

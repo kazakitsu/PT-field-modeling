@@ -401,6 +401,8 @@ def beta_polyfit(
     ridge: float = 0.0,              # optional L2 regularization (>=0)
     dtype=jnp.float32,
     warn_if_underdetermined: bool = True,
+    kmax: float | None = None,
+    k_weights: jnp.ndarray | None = None, # (Nk,); optional weights for k-bins
 ):
     """
     Fit beta_i(k, mu) on polynomial features.
@@ -439,24 +441,41 @@ def beta_polyfit(
             if Lk * Lm > Nk * Nmu:
                 warnings.warn(f"[beta_polyfit] Underdetermined (grid): Lk*Lmu={Lk*Lm} > Nk*Nmu={Nk*Nmu}. Consider ridge>0.")
 
+    Nk = int(beta_tab.shape[1])
+    if k_weights is None:
+        k_weights = jnp.ones((Nk,), dtype=dtype)
+    else:
+        if int(jnp.asarray(k_weights).shape[0]) != Nk:
+            raise ValueError(f"k_weights must have shape (Nk,) = ({Nk},), got {jnp.asarray(k_weights).shape}")
+        
+    kmax_eff = jnp.inf if (kmax is None) else float(kmax)
+    
+    k_mean_host = jnp.asarray(measure_pk.k_mean)
+    if kmax is not None and int(jnp.sum(k_mean_host <= kmax_eff)) == 0:
+        raise ValueError("kmax is too small: no k bins satisfy k <= kmax.")
+
     # Branches
     if not pairwise:
         if float(ridge) == 0.0:
             return _beta_polyfit_core_qr_grid(beta_tab, measure_pk=measure_pk, mu_edges=mu_edges,
-                                              k_pows=poly_k_pows, mu_pows=poly_mu_pows, dtype=dtype)
+                                              k_pows=poly_k_pows, mu_pows=poly_mu_pows, kmax=kmax_eff, k_weights=k_weights,
+                                              dtype=dtype)
         else:
             return _beta_polyfit_core_ridge_grid(beta_tab, measure_pk=measure_pk, mu_edges=mu_edges,
-                                                 k_pows=poly_k_pows, mu_pows=poly_mu_pows, ridge=ridge, dtype=dtype)
+                                                 k_pows=poly_k_pows, mu_pows=poly_mu_pows, ridge=ridge, kmax=kmax_eff, k_weights=k_weights,
+                                                 dtype=dtype)
 
     # pairwise=True
     if poly_k_pows.ndim == 1:
         # global term list
         if float(ridge) == 0.0:
             return _beta_polyfit_core_qr_pair(beta_tab, measure_pk=measure_pk, mu_edges=mu_edges,
-                                              k_pows=poly_k_pows, mu_pows=poly_mu_pows, dtype=dtype)
+                                              k_pows=poly_k_pows, mu_pows=poly_mu_pows,  kmax=kmax_eff, k_weights=k_weights,
+                                              dtype=dtype)
         else:
             return _beta_polyfit_core_ridge_pair(beta_tab, measure_pk=measure_pk, mu_edges=mu_edges,
-                                                 k_pows=poly_k_pows, mu_pows=poly_mu_pows, ridge=ridge, dtype=dtype)
+                                                 k_pows=poly_k_pows, mu_pows=poly_mu_pows, ridge=ridge,  kmax=kmax_eff, k_weights=k_weights,
+                                                 dtype=dtype)
 
     # per-field term list (2D exponents)
     if poly_k_pows.ndim != 2 or poly_mu_pows.ndim != 2:
@@ -482,15 +501,10 @@ def beta_polyfit(
         dtype=dtype,
     )
 
-
-# ------------------------------
-# JIT cores (common basis, batched across fields)
-# ------------------------------
-
 # ---------------- grid basis ----------------
 
 @partial(jit, static_argnames=('measure_pk','dtype'))
-def _beta_polyfit_core_qr_grid(beta_tab, *, measure_pk, mu_edges, k_pows, mu_pows, dtype=jnp.float32):
+def _beta_polyfit_core_qr_grid(beta_tab, *, measure_pk, mu_edges, k_pows, mu_pows, kmax=jnp.inf, k_weights=None, dtype=jnp.float32):
     n_fields, Nk, Nmu = beta_tab.shape
     dtype = jnp.dtype(dtype)
 
@@ -507,21 +521,26 @@ def _beta_polyfit_core_qr_grid(beta_tab, *, measure_pk, mu_edges, k_pows, mu_pow
     Phi = (K[:, None, :, None] * M[None, :, None, :]).reshape(Nk * Nmu, -1)  # (Nk*Nmu, P)
     Y = beta_tab.reshape(n_fields, Nk * Nmu).astype(dtype)    # (n, Nk*Nmu)
 
-    Q, R = jnp.linalg.qr(Phi, mode='reduced')
+    if k_weights is None:
+        k_weights = jnp.ones((Nk,), dtype=dtype)
+    sw = _row_sqrt_weights_from_k(k_arr, Nmu, kmax, k_weights, dtype)  # (Nk*Nmu,)
+    Phi_w = Phi * sw[:, None]       
+    Y_w   = Y * sw[None, :]        
+
+    Q, R = jnp.linalg.qr(Phi_w, mode='reduced')
     QT = jnp.swapaxes(Q, -1, -2)
 
     def solve_one(y):
         return jnp.linalg.solve(R, QT @ y)
-    Cvec = vmap(solve_one)(Y)                                 # (n, P)
+    Cvec = vmap(solve_one)(Y_w)                                 # (n, P)
 
     Lk = int(k_pows.shape[0]); Lm = int(mu_pows.shape[0])
     coeffs = Cvec.reshape(n_fields, Lk, Lm)
     beta_fit = (Phi @ Cvec.T).T.reshape(n_fields, Nk, Nmu).astype(dtype)
     return coeffs, beta_fit
 
-
 @partial(jit, static_argnames=('measure_pk','dtype'))
-def _beta_polyfit_core_ridge_grid(beta_tab, *, measure_pk, mu_edges, k_pows, mu_pows, ridge, dtype=jnp.float32):
+def _beta_polyfit_core_ridge_grid(beta_tab, *, measure_pk, mu_edges, k_pows, mu_pows, ridge, kmax=jnp.inf, k_weights=None, dtype=jnp.float32):
     n_fields, Nk, Nmu = beta_tab.shape
     dtype = jnp.dtype(dtype)
 
@@ -538,16 +557,22 @@ def _beta_polyfit_core_ridge_grid(beta_tab, *, measure_pk, mu_edges, k_pows, mu_
     Phi = (K[:, None, :, None] * M[None, :, None, :]).reshape(Nk * Nmu, -1)
     Y = beta_tab.reshape(n_fields, Nk * Nmu).astype(dtype)
 
+    if k_weights is None:
+        k_weights = jnp.ones((Nk,), dtype=dtype)
+    sw = _row_sqrt_weights_from_k(k_arr, Nmu, kmax, k_weights, dtype)  # (Nk*Nmu,)
+    Phi_w = Phi * sw[:, None]
+    Y_w = Y * sw[None, :]
+
     lam = jnp.asarray(ridge, dtype=dtype)
-    XtX = Phi.T @ Phi + lam * jnp.eye(Phi.shape[1], dtype=dtype)
+    XtX = Phi_w.T @ Phi_w + lam * jnp.eye(Phi_w.shape[1], dtype=dtype)
     L = jnp.linalg.cholesky(XtX)
 
     def solve_one(y):
-        rhs = Phi.T @ y
+        rhs = Phi_w.T @ y
         z   = lax.linalg.triangular_solve(L, rhs, left_side=True, lower=True)
         out = lax.linalg.triangular_solve(L.T, z, left_side=True, lower=False)
         return out
-    Cvec = vmap(solve_one)(Y)
+    Cvec = vmap(solve_one)(Y_w)
 
     Lk = int(k_pows.shape[0]); Lm = int(mu_pows.shape[0])
     coeffs = Cvec.reshape(n_fields, Lk, Lm)
@@ -556,7 +581,7 @@ def _beta_polyfit_core_ridge_grid(beta_tab, *, measure_pk, mu_edges, k_pows, mu_
 
 # ---------------- pairwise basis ----------------
 @partial(jit, static_argnames=('measure_pk','dtype'))
-def _beta_polyfit_core_qr_pair(beta_tab, *, measure_pk, mu_edges, k_pows, mu_pows, dtype=jnp.float32):
+def _beta_polyfit_core_qr_pair(beta_tab, *, measure_pk, mu_edges, k_pows, mu_pows, kmax=jnp.inf, k_weights=None, dtype=jnp.float32):
     """
     Pairwise LS: Phi columns are term-wise (k**k_pows[t])*(mu**mu_pows[t]).
     """
@@ -580,19 +605,25 @@ def _beta_polyfit_core_qr_pair(beta_tab, *, measure_pk, mu_edges, k_pows, mu_pow
 
     Y = beta_tab.reshape(n_fields, Nk * Nmu).astype(dtype)     # (n, Nk*Nmu)
 
-    Q, R = jnp.linalg.qr(Phi, mode='reduced')
+    if k_weights is None:
+        k_weights = jnp.ones((Nk,), dtype=dtype)
+    sw = _row_sqrt_weights_from_k(k_arr, Nmu, kmax, k_weights, dtype)         # (Nk*Nmu,)
+    Phi_w = Phi * sw[:, None]
+    Y_w = Y * sw[None, :]
+
+    Q, R = jnp.linalg.qr(Phi_w, mode='reduced')
     QT = jnp.swapaxes(Q, -1, -2)
 
     def solve_one(y):
         return jnp.linalg.solve(R, QT @ y)                    # (L,)
-    C = vmap(solve_one)(Y)                                    # (n, L)
+    C = vmap(solve_one)(Y_w)                                    # (n, L)
 
     beta_fit = (Phi @ C.T).T.reshape(n_fields, Nk, Nmu).astype(dtype)
     return C, beta_fit
 
 
 @partial(jit, static_argnames=('measure_pk','dtype'))
-def _beta_polyfit_core_ridge_pair(beta_tab, *, measure_pk, mu_edges, k_pows, mu_pows, ridge, dtype=jnp.float32):
+def _beta_polyfit_core_ridge_pair(beta_tab, *, measure_pk, mu_edges, k_pows, mu_pows, ridge,  kmax=jnp.inf, k_weights=None, dtype=jnp.float32):
     n_fields, Nk, Nmu = beta_tab.shape
     dtype = jnp.dtype(dtype)
 
@@ -612,16 +643,22 @@ def _beta_polyfit_core_ridge_pair(beta_tab, *, measure_pk, mu_edges, k_pows, mu_
 
     Y = beta_tab.reshape(n_fields, Nk * Nmu).astype(dtype)
 
+    if k_weights is None:
+        k_weights = jnp.ones((Nk,), dtype=dtype)
+    sw = _row_sqrt_weights_from_k(k_arr, Nmu, kmax, k_weights, dtype)  # (Nk*Nmu,)
+    Phi_w = Phi * sw[:, None]
+    Y_w = Y * sw[None, :]
+
     lam = jnp.asarray(ridge, dtype=dtype)
-    XtX = Phi.T @ Phi + lam * jnp.eye(Phi.shape[1], dtype=dtype)
+    XtX = Phi_w.T @ Phi_w + lam * jnp.eye(Phi_w.shape[1], dtype=dtype)
     Lc  = jnp.linalg.cholesky(XtX)
 
     def solve_one(y):
-        rhs = Phi.T @ y
+        rhs = Phi_w.T @ y
         z   = lax.linalg.triangular_solve(Lc,  rhs, left_side=True, lower=True)
         out = lax.linalg.triangular_solve(Lc.T, z,   left_side=True, lower=False)
         return out
-    C = vmap(solve_one)(Y)                                     # (n, L)
+    C = vmap(solve_one)(Y_w)                                     # (n, L)
 
     beta_fit = (Phi @ C.T).T.reshape(n_fields, Nk, Nmu).astype(dtype)
     return C, beta_fit
@@ -637,6 +674,8 @@ def _beta_polyfit_core_ridge_pair_perfield(
     mu_pows_2d: jnp.ndarray,         # (n, Lmax), int
     term_mask: jnp.ndarray,          # (n, Lmax), bool
     ridge: float,
+    kmax=jnp.inf, 
+    k_weights=None, 
     dtype=jnp.float32,
 ):
     n_fields, Nk, Nmu = beta_tab.shape
@@ -656,12 +695,13 @@ def _beta_polyfit_core_ridge_pair_perfield(
 
     def solve_one(i):
         kp = k_pows_2d[i]; mp = mu_pows_2d[i]; m = mask_2d[i]  # (Lmax,)
+        sw = _row_sqrt_weights_from_k(k_arr, Nmu, kmax, k_weights, dtype)  # (Nk*Nmu,)
         # Build Phi_i columns (zeroed if masked)
         def build_col(t):
             Kt = (k_arr ** kp[t]).astype(dtype)               # (Nk,)
             Mt = (mu_mean ** mp[t]).astype(dtype)            # (Nmu,)
             col = (Kt[:, None] * Mt[None, :]).reshape(Nk * Nmu)  # (Nk*Nmu,)
-            return col * m[t]
+            return col * m[t] *sw
         Phi_i = vmap(build_col)(jnp.arange(Lmax, dtype=jnp.int32)).T  # (Nk*Nmu, Lmax)
 
         y = y_all[i]                                                  # (Nk*Nmu,)
@@ -686,207 +726,27 @@ def _beta_polyfit_core_ridge_pair_perfield(
     beta_fit = lax.map(recon_one, jnp.arange(n_fields, dtype=jnp.int32))  # (n, Nk, Nmu)
     return C, beta_fit
 
-@partial(jit, static_argnames=('measure_pk','pairwise','dtype'))
-def _beta_polyfit_core_qr_batched(
-    beta_tab: jnp.ndarray,           # (n_fields, Nk, Nmu)
-    *,
-    measure_pk,
-    mu_edges: jnp.ndarray,
-    poly_k_pows: jnp.ndarray,        # (Lk,) or (L,)
-    poly_mu_pows: jnp.ndarray,       # (Lmu,) or (L,)
-    pairwise: bool,
-    dtype=jnp.float32,
+def _row_sqrt_weights_from_k(
+    k_arr: jnp.ndarray,     # (Nk,)
+    Nmu: int,
+    kmax: float,
+    k_weights: jnp.ndarray, # (Nk,)
+    dtype,
 ):
-    """QR-based LS for common basis across all fields."""
-    n_fields, Nk, Nmu = beta_tab.shape
-    dtype = jnp.dtype(dtype)
+    # Build per row sqrt weights for (k, mu) grid ordering where mu runs fastest.
+    kmax = jnp.asarray(kmax, dtype=dtype)
+    wk = jnp.asarray(k_weights, dtype=dtype)
 
-    # k and mu bin centers
-    k_arr = jnp.asarray(measure_pk.k_mean, dtype=dtype)               # (Nk,)
-    mu_lo, mu_hi = mu_edges[:-1], mu_edges[1:]
-    mu_mean = vmap(lambda a, b: measure_pk.compute_mu_mean(a, b))(mu_lo, mu_hi).astype(dtype)  # (Nmu,)
+    mask = (k_arr <= kmax).astype(dtype)
+    wk = wk * mask
 
-    if pairwise:
-        # L paired columns
-        L = int(poly_k_pows.shape[0])
-        K = (k_arr[:, None] ** poly_k_pows[None, :]).astype(dtype)    # (Nk, L)
-        M = (mu_mean[:, None] ** poly_mu_pows[None, :]).astype(dtype) # (Nmu, L)
-        Phi = (K[:, None, :] * M[None, :, :]).reshape(Nk * Nmu, L)    # (Nk*Nmu, L)
-    else:
-        # Grid basis
-        K = (k_arr[:, None] ** poly_k_pows[None, :]).astype(dtype)    # (Nk, Lk)
-        M = (mu_mean[:, None] ** poly_mu_pows[None, :]).astype(dtype) # (Nmu, Lmu)
-        Phi = (K[:, None, :, None] * M[None, :, None, :]).reshape(Nk * Nmu, -1)  # (Nk*Nmu, Lk*Lmu)
+    # Flatten weights to match Phi rows: (Nk, Nmu) -> (Nk*Nmu,)
+    w_flat = (wk[:, None] * jnp.ones((1, Nmu), dtype=dtype)).reshape(-1)
 
-    Y = beta_tab.reshape(n_fields, Nk * Nmu).astype(dtype)            # (n_fields, Nk*Nmu)
+    # Guard against negative weights
+    w_flat = jnp.maximum(w_flat, jnp.asarray(0, dtype=dtype))
+    return jnp.sqrt(w_flat)
 
-    # Least squares via QR: c = solve(R, Q^T y), valid when rows >= cols
-    Q, R = jnp.linalg.qr(Phi, mode='reduced')                         # Q:(M,K), R:(K,K)
-    QT = jnp.swapaxes(Q, -1, -2)                                      # (K, M)
-    def solve_one(y): return jnp.linalg.solve(R, QT @ y)              # (K,)
-    Cvec = vmap(solve_one)(Y)                                         # (n_fields, K)
-
-    # Reshape coeffs and reconstruct beta_tab
-    if pairwise:
-        coeffs = Cvec.reshape(n_fields, int(poly_k_pows.shape[0]))     # (n_fields, L)
-    else:
-        Lk = int(poly_k_pows.shape[0]); Lm = int(poly_mu_pows.shape[0])
-        coeffs = Cvec.reshape(n_fields, Lk, Lm)                        # (n_fields, Lk, Lm)
-    beta_fit = (Phi @ Cvec.T).T.reshape(n_fields, Nk, Nmu).astype(dtype)
-
-    return coeffs, beta_fit
-
-
-@partial(jit, static_argnames=('measure_pk','pairwise','dtype'))
-def _beta_polyfit_core_ridge_batched(
-    beta_tab: jnp.ndarray,           # (n_fields, Nk, Nmu)
-    *,
-    measure_pk,
-    mu_edges: jnp.ndarray,
-    poly_k_pows: jnp.ndarray,        # (Lk,) or (L,)
-    poly_mu_pows: jnp.ndarray,       # (Lmu,) or (L,)
-    pairwise: bool,
-    ridge: float,
-    dtype=jnp.float32,
-):
-    """Ridge-regularized LS (common basis) via normal equations + Cholesky."""
-    n_fields, Nk, Nmu = beta_tab.shape
-    dtype = jnp.dtype(dtype)
-
-    k_arr = jnp.asarray(measure_pk.k_mean, dtype=dtype)
-    mu_lo, mu_hi = mu_edges[:-1], mu_edges[1:]
-    mu_mean = vmap(lambda a, b: measure_pk.compute_mu_mean(a, b))(mu_lo, mu_hi).astype(dtype)
-
-    if pairwise:
-        L = int(poly_k_pows.shape[0])
-        K = (k_arr[:, None] ** poly_k_pows[None, :]).astype(dtype)    # (Nk, L)
-        M = (mu_mean[:, None] ** poly_mu_pows[None, :]).astype(dtype) # (Nmu, L)
-        Phi = (K[:, None, :] * M[None, :, :]).reshape(Nk * Nmu, L)
-    else:
-        K = (k_arr[:, None] ** poly_k_pows[None, :]).astype(dtype)    # (Nk, Lk)
-        M = (mu_mean[:, None] ** poly_mu_pows[None, :]).astype(dtype) # (Nmu, Lmu)
-        Phi = (K[:, None, :, None] * M[None, :, None, :]).reshape(Nk * Nmu, -1)
-
-    Y = beta_tab.reshape(n_fields, Nk * Nmu).astype(dtype)
-
-    lam = jnp.asarray(ridge, dtype=dtype)
-    XtX = Phi.T @ Phi + lam * jnp.eye(Phi.shape[1], dtype=dtype)
-    Lc  = jnp.linalg.cholesky(XtX)
-
-    def solve_one(y):
-        rhs = Phi.T @ y
-        z   = lax.linalg.triangular_solve(Lc,   rhs, left_side=True, lower=True)
-        out = lax.linalg.triangular_solve(Lc.T, z,   left_side=True, lower=False)
-        return out
-    Cvec = vmap(solve_one)(Y)
-
-    if pairwise:
-        coeffs = Cvec.reshape(n_fields, int(poly_k_pows.shape[0]))     # (n_fields, L)
-    else:
-        Lk = int(poly_k_pows.shape[0]); Lm = int(poly_mu_pows.shape[0])
-        coeffs = Cvec.reshape(n_fields, Lk, Lm)                        # (n_fields, Lk, Lm)
-    beta_fit = (Phi @ Cvec.T).T.reshape(n_fields, Nk, Nmu).astype(dtype)
-
-    return coeffs, beta_fit
-
-
-# ------------------------------
-# JIT cores (single-field, per-field basis)
-# ------------------------------
-
-@partial(jit, static_argnames=('measure_pk','pairwise','dtype'))
-def _beta_polyfit_single_qr(
-    beta_i: jnp.ndarray,             # (Nk, Nmu) for a single field
-    *,
-    measure_pk,
-    mu_edges: jnp.ndarray,
-    poly_k_pows: jnp.ndarray,        # (Lk,) or (L,)
-    poly_mu_pows: jnp.ndarray,       # (Lmu,) or (L,)
-    pairwise: bool,
-    dtype=jnp.float32,
-):
-    """QR LS for one field with its own basis."""
-    Nk, Nmu = beta_i.shape
-    dtype = jnp.dtype(dtype)
-
-    k_arr = jnp.asarray(measure_pk.k_mean, dtype=dtype)
-    mu_lo, mu_hi = mu_edges[:-1], mu_edges[1:]
-    mu_mean = vmap(lambda a, b: measure_pk.compute_mu_mean(a, b))(mu_lo, mu_hi).astype(dtype)
-
-    if pairwise:
-        L = int(poly_k_pows.shape[0])
-        K = (k_arr[:, None] ** poly_k_pows[None, :]).astype(dtype)    # (Nk, L)
-        M = (mu_mean[:, None] ** poly_mu_pows[None, :]).astype(dtype) # (Nmu, L)
-        Phi = (K[:, None, :] * M[None, :, :]).reshape(Nk * Nmu, L)
-    else:
-        K = (k_arr[:, None] ** poly_k_pows[None, :]).astype(dtype)    # (Nk, Lk)
-        M = (mu_mean[:, None] ** poly_mu_pows[None, :]).astype(dtype) # (Nmu, Lmu)
-        Phi = (K[:, None, :, None] * M[None, :, None, :]).reshape(Nk * Nmu, -1)
-
-    y = beta_i.reshape(Nk * Nmu).astype(dtype)
-
-    Q, R = jnp.linalg.qr(Phi, mode='reduced')                         # Q:(M,K), R:(K,K)
-    coeff = jnp.linalg.solve(R, (Q.T @ y))                            # (K,)
-
-    # Reshape coeff & reconstruct
-    if pairwise:
-        coeffs = coeff                                                # (L,)
-    else:
-        Lk = int(poly_k_pows.shape[0]); Lm = int(poly_mu_pows.shape[0])
-        coeffs = coeff.reshape(Lk, Lm)                                # (Lk, Lm)
-
-    beta_fit = (Phi @ coeff).reshape(Nk, Nmu).astype(dtype)
-    return coeffs, beta_fit
-
-
-@partial(jit, static_argnames=('measure_pk','pairwise','dtype'))
-def _beta_polyfit_single_ridge(
-    beta_i: jnp.ndarray,             # (Nk, Nmu)
-    *,
-    measure_pk,
-    mu_edges: jnp.ndarray,
-    poly_k_pows: jnp.ndarray,        # (Lk,) or (L,)
-    poly_mu_pows: jnp.ndarray,       # (Lmu,) or (L,)
-    pairwise: bool,
-    ridge: float,
-    dtype=jnp.float32,
-):
-    """Ridge LS for one field with its own basis."""
-    Nk, Nmu = beta_i.shape
-    dtype = jnp.dtype(dtype)
-
-    k_arr = jnp.asarray(measure_pk.k_mean, dtype=dtype)
-    mu_lo, mu_hi = mu_edges[:-1], mu_edges[1:]
-    mu_mean = vmap(lambda a, b: measure_pk.compute_mu_mean(a, b))(mu_lo, mu_hi).astype(dtype)
-
-    if pairwise:
-        L = int(poly_k_pows.shape[0])
-        K = (k_arr[:, None] ** poly_k_pows[None, :]).astype(dtype)    # (Nk, L)
-        M = (mu_mean[:, None] ** poly_mu_pows[None, :]).astype(dtype) # (Nmu, L)
-        Phi = (K[:, None, :] * M[None, :, :]).reshape(Nk * Nmu, L)
-    else:
-        K = (k_arr[:, None] ** poly_k_pows[None, :]).astype(dtype)    # (Nk, Lk)
-        M = (mu_mean[:, None] ** poly_mu_pows[None, :]).astype(dtype) # (Nmu, Lmu)
-        Phi = (K[:, None, :, None] * M[None, :, None, :]).reshape(Nk * Nmu, -1)
-
-    y = beta_i.reshape(Nk * Nmu).astype(dtype)
-
-    lam = jnp.asarray(ridge, dtype=dtype)
-    XtX = Phi.T @ Phi + lam * jnp.eye(Phi.shape[1], dtype=dtype)
-    Lc  = jnp.linalg.cholesky(XtX)
-
-    rhs = Phi.T @ y
-    z   = lax.linalg.triangular_solve(Lc,   rhs, left_side=True, lower=True)
-    coeff = lax.linalg.triangular_solve(Lc.T, z, left_side=True, lower=False)
-
-    if pairwise:
-        coeffs = coeff                                                # (L,)
-    else:
-        Lk = int(poly_k_pows.shape[0]); Lm = int(poly_mu_pows.shape[0])
-        coeffs = coeff.reshape(Lk, Lm)                                # (Lk, Lm)
-
-    beta_fit = (Phi @ coeff).reshape(Nk, Nmu).astype(dtype)
-    return coeffs, beta_fit
 
 # -------------------- Utils for diagnostics --------------------
 
@@ -985,25 +845,41 @@ def check_max_rij(rij: jnp.ndarray) -> None:
                 print(f"{i}{j}  max|r_ij| = {val:.3e}")
 
 
-@partial(jit, static_argnames=('measure_pk',))
+@partial(jit, static_argnames=("measure_pk", "cross"))
 def compute_pks_2d(
     fields_k: jnp.ndarray,   # (n_fields, ng, ng, ng//2+1), complex
     mu_edges: jnp.ndarray,   # (Nmu+1,)
     *,
-    measure_pk               # Measure_Pk instance (static)
+    measure_pk,              # Measure_Pk instance (static)
+    cross: bool = False,     # If True, return auto + cross spectra
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Measure auto P(k) for many fields across all mu-bins in one pass.
+    Measure P(k, mu) for many fields across all mu-bins.
+
+    Parameters
+    ----------
+    fields_k : array
+        Shape (n_fields, ng, ng, ng//2+1), complex Fourier-space fields.
+    mu_edges : array
+        Shape (Nmu+1,), mu-bin edges.
+    measure_pk : callable / Measure_Pk
+        Power spectrum estimator. Must support:
+        - measure_pk(a, None, ell=0, mu_min=..., mu_max=...) for auto
+        - measure_pk(a, b,    ell=0, mu_min=..., mu_max=...) for cross
+        and return an array with columns [..., P, N_modes] as in your code.
+    cross : bool, default=False
+        - False: return only autos, shape (n_fields, Nk, Nmu)
+        - True : return full auto+cross matrix, shape (n_fields, n_fields, Nk, Nmu)
 
     Returns
     -------
-    k_arr   : (Nk,)                 # bin-averaged k
-    P_many  : (n, Nk, Nmu)          # auto power for each field and mu-bin
-    N_modes : (Nk, Nmu)             # counts per (k,mu) (field-independent)
-    Notes
-    -----
-    - Loops over mu-bins with fori_loop.
-    - Inside each mu-bin, uses lax.map over field index.
+    k_arr : (Nk,)
+        Bin-averaged k (from measure_pk.k_mean)
+    P_many : ndarray
+        - cross=False -> (n_fields, Nk, Nmu)
+        - cross=True  -> (n_fields, n_fields, Nk, Nmu)
+    N_modes : (Nk, Nmu)
+        Mode counts per (k, mu), field-independent
     """
     n_fields = fields_k.shape[0]
     dtype = measure_pk.dtype
@@ -1011,25 +887,72 @@ def compute_pks_2d(
     Nk = int(k_arr.shape[0])
     Nmu = int(mu_edges.shape[0] - 1)
 
-    def mu_body(m, carry):
+    if not cross:
+        def mu_body_auto(m, carry):
+            P_acc, N_acc = carry
+            mu_min = mu_edges[m]
+            mu_max = mu_edges[m + 1]
+
+            # N_modes is field-independent; read it from the first field
+            out0 = measure_pk(fields_k[0], None, ell=0, mu_min=mu_min, mu_max=mu_max)
+            N_m = out0[:, 2].astype(dtype)  # (Nk,)
+
+            def one_field(i):
+                out = measure_pk(fields_k[i], None, ell=0, mu_min=mu_min, mu_max=mu_max)
+                return out[:, 1].astype(dtype)  # (Nk,)
+
+            P_m = lax.map(one_field, jnp.arange(n_fields, dtype=jnp.int32))  # (n, Nk)
+
+            P_acc = P_acc.at[:, :, m].set(P_m)
+            N_acc = N_acc.at[:, m].set(N_m)
+            return (P_acc, N_acc)
+
+        P0 = jnp.zeros((n_fields, Nk, Nmu), dtype=dtype)
+        N0 = jnp.zeros((Nk, Nmu), dtype=dtype)
+        P_many, N_modes = lax.fori_loop(0, Nmu, mu_body_auto, (P0, N0))
+        return k_arr, P_many, N_modes
+
+    # cross=True branch
+    ii, jj = jnp.triu_indices(n_fields, k=1)  # off-diagonal upper triangle only
+    npairs = int(ii.shape[0])
+    diag_idx = jnp.arange(n_fields, dtype=jnp.int32)
+
+    def mu_body_cross(m, carry):
         P_acc, N_acc = carry
         mu_min = mu_edges[m]
         mu_max = mu_edges[m + 1]
 
-        # We also grab N_modes from the first field; it's field-independent.
+        # N_modes is field-independent; read it from the first field
         out0 = measure_pk(fields_k[0], None, ell=0, mu_min=mu_min, mu_max=mu_max)
-        N_m  = out0[:, 2].astype(dtype)                         # (Nk,)
+        N_m = out0[:, 2].astype(dtype)  # (Nk,)
 
-        def one_field(i):
+        # 1) Autos
+        def auto_body(i):
             out = measure_pk(fields_k[i], None, ell=0, mu_min=mu_min, mu_max=mu_max)
-            return out[:, 1].astype(dtype)                      # (Nk,)
+            return out[:, 1].astype(dtype)  # (Nk,)
 
-        P_m = lax.map(one_field, jnp.arange(n_fields, dtype=jnp.int32))  # (n, Nk)
-        P_acc = P_acc.at[:, :, m].set(P_m)
+        Auto = lax.map(auto_body, jnp.arange(n_fields, dtype=jnp.int32))  # (n, Nk)
+
+        # 2) Off-diagonal crosses (i < j)
+        def pair_body(pidx):
+            i = ii[pidx]
+            j = jj[pidx]
+            out = measure_pk(fields_k[i], fields_k[j], ell=0, mu_min=mu_min, mu_max=mu_max)
+            return out[:, 1].astype(dtype)  # (Nk,)
+
+        P_pairs = lax.map(pair_body, jnp.arange(npairs, dtype=jnp.int32))  # (npairs, Nk)
+
+        # 3) Assemble full symmetric matrix P_ij(k)
+        P_m = jnp.zeros((n_fields, n_fields, Nk), dtype=dtype)
+        P_m = P_m.at[diag_idx, diag_idx, :].set(Auto)
+        P_m = P_m.at[ii, jj, :].set(P_pairs)
+        P_m = P_m.at[jj, ii, :].set(P_pairs)
+
+        P_acc = P_acc.at[:, :, :, m].set(P_m)
         N_acc = N_acc.at[:, m].set(N_m)
         return (P_acc, N_acc)
 
-    P0 = jnp.zeros((n_fields, Nk, Nmu), dtype=dtype)
+    P0 = jnp.zeros((n_fields, n_fields, Nk, Nmu), dtype=dtype)
     N0 = jnp.zeros((Nk, Nmu), dtype=dtype)
-    P_many, N_modes = lax.fori_loop(0, Nmu, mu_body, (P0, N0))
+    P_many, N_modes = lax.fori_loop(0, Nmu, mu_body_cross, (P0, N0))
     return k_arr, P_many, N_modes
