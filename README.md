@@ -28,8 +28,8 @@ Core ideas:
   - LPT displacement in real space, with optional **RSD**: $\psi_z \rightarrow \psi_z (1 + f)$.
   - Scalar field builders up to **cubic** order: $1, \delta_1, \delta_1^2, {\mathcal{G}_2}, \delta_1^3, \delta{\mathcal{G}_2}, {\mathcal{G}_3}, {\Gamma_3}$ and $S_3 = {\boldsymbol\psi_2}\cdot\nabla \delta_1$
     - With `rsd=True`, also builds ${\mathcal{G}^{\parallel}_{2}}$.  
-    - With `lya=True`, also builds $\eta$-related helpers: $\eta^2$, $\delta\eta$, $KK^{\parallel}$.
-    - With `lya_full_fields=True`, also builds $\Pi^{[2]}^{\parallel}$ (and $\delta^3$).
+    - With `lya=True`, also builds $\eta$-related helpers: $\eta^2$, $\delta\eta$, $KK_{\parallel}$.
+    - With `lya_full_fields=True`, also builds $\Pi^{[2]}_{\parallel}$ (and $\delta^3$).
   - Tensor field builders up to **quadratic** order: $K_{ij}, \delta K_{ij}, H_{ij}, T_{ij}$
     - `rsd` is not supported yet.
 
